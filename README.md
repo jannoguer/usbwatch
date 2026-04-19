@@ -20,6 +20,8 @@ pythonw monitor.py
 python3 monitor.py &
 ```
 
+`--depth N` can be used to set how many directory levels are fully expanded in the snapshot (default: 4). Directories beyond that depth are listed with a file count instead of individual filenames.
+
 For persistent background execution use Task Scheduler (Windows) or a systemd unit (Linux).
 
 ## Output
