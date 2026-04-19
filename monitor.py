@@ -5,6 +5,7 @@ import os
 import sys
 import platform
 import logging
+import logging.handlers
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -16,11 +17,15 @@ LOGS_DIR.mkdir(exist_ok=True)
 sys.stdout = open(os.devnull, "w")
 sys.stderr = open(os.devnull, "w")
 
-logging.basicConfig(
-    filename=str(LOGS_DIR / "monitor.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+_root_handler = logging.handlers.RotatingFileHandler(
+    str(LOGS_DIR / "monitor.log"),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
 )
+_root_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.getLogger().addHandler(_root_handler)
+logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
 # drive_id -> {"observer": Observer, "ev_log": Logger, "fh": FileHandler}
