@@ -13,6 +13,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
+SNAPSHOT_MAX_DEPTH = 4
 
 sys.stdout = open(os.devnull, "w")
 sys.stderr = open(os.devnull, "w")
@@ -46,9 +47,13 @@ def _snapshot(mount: Path, label: str) -> None:
     path = LOGS_DIR / f"snapshot_{_safe(label)}_{_timestamp()}.txt"
     try:
         with open(path, "w", encoding="utf-8", errors="replace") as f:
-            for root, _dirs, files in os.walk(mount):
+            for root, dirs, files in os.walk(mount):
                 rel = os.path.relpath(root, mount)
                 depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth > SNAPSHOT_MAX_DEPTH:
+                    dirs.clear()
+                    continue
+                dirs.sort()
                 indent = "    " * depth
                 name = str(mount) if rel == "." else os.path.basename(root)
                 f.write(f"{indent}{name}/\n")
@@ -60,8 +65,9 @@ def _snapshot(mount: Path, label: str) -> None:
 
 
 def _make_event_logger(label: str) -> tuple:
-    path = LOGS_DIR / f"events_{_safe(label)}_{_timestamp()}.log"
-    lg = logging.getLogger(f"usb.{_safe(label)}.{_timestamp()}")
+    ts = _timestamp()
+    path = LOGS_DIR / f"events_{_safe(label)}_{ts}.log"
+    lg = logging.getLogger(f"usb.{_safe(label)}.{ts}")
     lg.setLevel(logging.INFO)
     lg.propagate = False
     fh = logging.FileHandler(str(path), encoding="utf-8")
