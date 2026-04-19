@@ -117,16 +117,26 @@ def on_connect(drive_id: str, mount: Path, label: str) -> None:
     with _lock:
         if drive_id in _active:
             return
-        log.info("USB connected: id=%s mount=%s label=%s", drive_id, mount, label)
-        _snapshot(mount, label)
-        obs, ev_log, fh = _start_watcher(mount, label)
+        _active[drive_id] = None  # reserve slot; prevents duplicate connect races
+
+    log.info("USB connected: id=%s mount=%s label=%s", drive_id, mount, label)
+    threading.Thread(target=_snapshot, args=(mount, label), daemon=True).start()
+    obs, ev_log, fh = _start_watcher(mount, label)
+
+    with _lock:
         _active[drive_id] = {"observer": obs, "ev_log": ev_log, "fh": fh}
 
 
 def on_disconnect(drive_id: str) -> None:
     with _lock:
         entry = _active.pop(drive_id, None)
-    if not entry:
+    if entry is None:
+        return
+    if not isinstance(entry, dict):
+        log.warning(
+            "Disconnect during connect setup for %s; watcher may not have started",
+            drive_id,
+        )
         return
     log.info("USB disconnected: id=%s", drive_id)
     try:
