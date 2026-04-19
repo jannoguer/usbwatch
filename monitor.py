@@ -15,11 +15,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
+
 def _parse_args() -> int:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--depth", type=int, default=4)
     args, _ = p.parse_known_args()
     return args.depth
+
 
 SNAPSHOT_MAX_DEPTH = _parse_args()
 
