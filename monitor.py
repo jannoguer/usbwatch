@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import platform
@@ -13,7 +14,14 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
-SNAPSHOT_MAX_DEPTH = 4
+
+def _parse_args() -> int:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--depth", type=int, default=4)
+    args, _ = p.parse_known_args()
+    return args.depth
+
+SNAPSHOT_MAX_DEPTH = _parse_args()
 
 sys.stdout = open(os.devnull, "w")
 sys.stderr = open(os.devnull, "w")
@@ -50,12 +58,13 @@ def _snapshot(mount: Path, label: str) -> None:
             for root, dirs, files in os.walk(mount):
                 rel = os.path.relpath(root, mount)
                 depth = 0 if rel == "." else rel.count(os.sep) + 1
-                if depth > SNAPSHOT_MAX_DEPTH:
-                    dirs.clear()
-                    continue
                 dirs.sort()
                 indent = "    " * depth
                 name = str(mount) if rel == "." else os.path.basename(root)
+                if depth > SNAPSHOT_MAX_DEPTH:
+                    f.write(f"{indent}{name}/ ({len(files)} files)\n")
+                    dirs.clear()
+                    continue
                 f.write(f"{indent}{name}/\n")
                 for fname in sorted(files):
                     f.write(f"{'    ' * (depth + 1)}{fname}\n")
