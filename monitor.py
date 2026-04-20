@@ -30,8 +30,7 @@ def _parse_args() -> argparse.Namespace:
 
 _args = _parse_args()
 
-# Set up file logging BEFORE redirecting stdout/stderr so any setup failure
-# (e.g. unwritable logs/) is still visible on the real stderr.
+# Set up file logging before redirecting stdout/stderr.
 _root_handler = logging.handlers.RotatingFileHandler(
     str(LOGS_DIR / "monitor.log"),
     maxBytes=5 * 1024 * 1024,
@@ -43,7 +42,7 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# Silence all console output now that logging is confirmed working.
+# Silence console output.
 _devnull_out = open(os.devnull, "w")
 _devnull_err = open(os.devnull, "w")
 sys.stdout = _devnull_out
@@ -63,33 +62,32 @@ def _safe(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))
 
 
-# Directory names to skip before recursing. These are system artefacts that
-# appear on Windows and macOS-formatted drives and are never useful to scan.
-_JUNK_DIRS: frozenset[str] = frozenset({
-    "System Volume Information",
-    "$RECYCLE.BIN",
-    ".Trashes",
-    ".fseventsd",
-    ".Spotlight-V100",
-    ".TemporaryItems",
-})
+# System directories to skip.
+_JUNK_DIRS: frozenset[str] = frozenset(
+    {
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".Trashes",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".TemporaryItems",
+    }
+)
 
 
 def _volume_serial(mount: Path) -> str | None:
-    """Return a stable identifier for the volume at *mount*.
-
-    - Windows: hexadecimal ``VolumeSerialNumber`` from ``GetVolumeInformationW``.
-    - Linux:   ``ID_FS_UUID`` injected via :func:`on_connect` (see caller); this
-               function returns ``None`` on Linux so the caller can fall back to
-               the value already retrieved from the udev device object.
-    """
+    """Get stable volume identifier."""
     if platform.system() == "Windows":
         serial = ctypes.c_ulong(0)
         rc = ctypes.windll.kernel32.GetVolumeInformationW(
             str(mount),
-            None, 0,
+            None,
+            0,
             ctypes.byref(serial),
-            None, None, None, 0,
+            None,
+            None,
+            None,
+            0,
         )
         if rc:
             return format(serial.value, "08x")
@@ -98,11 +96,7 @@ def _volume_serial(mount: Path) -> str | None:
 
 
 def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
-    """Load the most recent full snapshot manifest for *serial* from ``logs/``.
-
-    Returns a mapping of ``{relpath: (size, mtime)}`` where *size* is an int
-    for files or the string ``"-"`` for dirs/symlinks.
-    """
+    """Load latest snapshot manifest."""
     pattern = f"snapshot_*_{serial}_*.tsv.gz"
     candidates = sorted(LOGS_DIR.glob(pattern), key=lambda p: p.name, reverse=True)
     if not candidates:
@@ -116,20 +110,19 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
                 if len(parts) != 4:
                     continue
                 relpath, size_s, mtime, _ = parts
-                size: int | str = int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
+                size: int | str = (
+                    int(size_s)
+                    if size_s.lstrip("-").isdigit() and size_s != "-"
+                    else "-"
+                )
                 manifest[relpath] = (size, mtime)
     except Exception:
         log.exception("Failed to load manifest %s", candidates[0])
     return manifest
 
 
-def _scan_entries(
-    mount: Path,
-) -> dict[str, tuple[int | str, str, str]]:
-    """Walk *mount* and return ``{relpath: (size, mtime, flag)}``.
-
-    Shared by :func:`_snapshot` and :func:`_write_delta`.
-    """
+def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
+    """Scan directory and return file metadata map."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
     while stack:
@@ -145,9 +138,9 @@ def _scan_entries(
             if entry.is_symlink():
                 try:
                     mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                    mtime = datetime.fromtimestamp(
-                        mtime_ts, tz=timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
                 except OSError:
                     mtime = "-"
                 entries_map[relpath] = ("-", mtime, "L")
@@ -158,9 +151,9 @@ def _scan_entries(
                 dirs_to_push.append(Path(entry.path))
                 try:
                     mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                    mtime = datetime.fromtimestamp(
-                        mtime_ts, tz=timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
                 except OSError:
                     mtime = "-"
                 entries_map[relpath] = ("-", mtime, "D")
@@ -181,20 +174,9 @@ def _scan_entries(
 
 
 def _write_delta(
-    mount: Path,
-    label: str,
-    serial: str,
-    old_manifest: dict[str, tuple[int | str, str]],
+    mount: Path, label: str, serial: str, old_manifest: dict[str, tuple[int | str, str]]
 ) -> None:
-    """Compare the current drive state against *old_manifest* and write a delta.
-
-    Delta lines are prefixed with:
-    - ``+`` addition (new path)
-    - ``-`` deletion (path gone)
-    - ``~`` modification (size or mtime changed)
-
-    Output is gzip-compressed TSV written atomically.
-    """
+    """Write differential changes against old manifest."""
     ts = _timestamp()
     final = LOGS_DIR / f"delta_{_safe(label)}_{serial}_{ts}.tsv.gz"
     tmp = final.with_suffix(".tsv.gz.tmp")
@@ -231,28 +213,7 @@ def _write_delta(
 
 
 def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
-    """Walk *mount* with os.scandir and write a gzip-compressed manifest.
-
-    Output format — one line per entry::
-
-        <relpath>\t<size>\t<mtime_iso8601_utc>\t<flag>\n
-
-    where *flag* is ``D`` (directory), ``L`` (symlink), or ``F`` (file),
-    *size* is the byte count for files or ``-`` for dirs/symlinks, and
-    *mtime* is UTC in ``YYYY-MM-DDTHH:MM:SSZ`` format.
-
-    The manifest is written to a ``.tsv.gz.tmp`` file and atomically renamed
-    to ``.tsv.gz`` on success to prevent half-written files.
-
-    If *serial* is provided it is embedded in the filename so that
-    :func:`_load_manifest` can locate the right file on reconnect.
-
-    Design note — deliberately single-threaded:
-        USB mass-storage devices expose a single command queue. Running two or
-        more scanner threads causes seek thrash on FAT/exFAT and NTFS-over-USB
-        and is slower than a single ordered scan. Parallelism would only help
-        if we were hashing file contents, which is a separate concern.
-    """
+    """Write complete snapshot manifest."""
     serial_tag = f"_{serial}" if serial else ""
     ts = _timestamp()
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
@@ -271,7 +232,7 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                     continue
                 dirs_to_push: list[Path] = []
                 for entry in entries:
-                    # Skip symlinks to avoid reparse-point / junction loops.
+                    # Skip symlinks to avoid loops.
                     if entry.is_symlink():
                         relpath = os.path.relpath(entry.path, mount)
                         try:
@@ -312,8 +273,7 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                         line = f"{relpath}\t{size}\t{mtime}\tF\n"
                     buf.write(line.encode("utf-8", errors="replace"))
                     count += 1
-                # Push subdirectories in reverse-sorted order so the stack
-                # processes them in sorted order (leftmost first).
+                # Push subdirectories in reverse-sorted order.
                 dirs_to_push.sort(key=lambda p: p.name, reverse=True)
                 stack.extend(dirs_to_push)
                 if count % 10_000 == 0 and count > 0:
@@ -345,8 +305,7 @@ def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None
     try:
         ev_log.removeHandler(fh)
         fh.close()
-        # Remove from the global logger registry to prevent accumulation over
-        # many plug/unplug cycles.
+        # Remove from global logger registry.
         logging.Logger.manager.loggerDict.pop(ev_log.name, None)
     except Exception:
         pass
@@ -390,13 +349,11 @@ def _start_watcher(mount: Path, label: str) -> tuple:
 
 
 def _do_snapshot(mount: Path, label: str, serial: str | None) -> None:
-    """Decide between a full snapshot and a differential delta, then run it."""
+    """Execute snapshot or delta."""
     if serial:
         old = _load_manifest(serial)
         if old:
-            log.info(
-                "Prior manifest found for serial %s; writing delta", serial
-            )
+            log.info("Prior manifest found for serial %s; writing delta", serial)
             _write_delta(mount, label, serial, old)
             return
     _snapshot(mount, label, serial)
@@ -408,13 +365,16 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
             return
         _active[drive_id] = None  # reserve slot; prevents duplicate connect races
 
-    # Resolve volume serial on Windows; Linux passes it in directly.
+    # Resolve volume serial.
     if serial is None:
         serial = _volume_serial(mount)
 
     log.info(
         "USB connected: id=%s mount=%s label=%s serial=%s",
-        drive_id, mount, label, serial or "unknown",
+        drive_id,
+        mount,
+        label,
+        serial or "unknown",
     )
     threading.Thread(
         target=_do_snapshot, args=(mount, label, serial), daemon=True
@@ -423,8 +383,7 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
 
     with _lock:
         if drive_id not in _active:
-            # Drive was disconnected while the watcher was starting; the slot was
-            # already popped by on_disconnect, so stop the orphaned observer now.
+            # Teardown observer if drive disconnected during setup.
             log.warning(
                 "Drive %s disconnected during setup; tearing down observer", drive_id
             )
@@ -432,7 +391,12 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
             obs.join(timeout=5)
             _close_event_logger(ev_log, fh)
             return
-        _active[drive_id] = {"observer": obs, "ev_log": ev_log, "fh": fh, "serial": serial}
+        _active[drive_id] = {
+            "observer": obs,
+            "ev_log": ev_log,
+            "fh": fh,
+            "serial": serial,
+        }
 
 
 def on_disconnect(drive_id: str) -> None:
@@ -465,7 +429,7 @@ if SYSTEM == "Windows":
         import pythoncom
         import wmi
 
-        # Each thread that uses COM/WMI must call CoInitialize.
+        # Initialize COM.
         pythoncom.CoInitialize()
         try:
             c = wmi.WMI()
@@ -532,17 +496,14 @@ if SYSTEM == "Windows":
         )
         t_add.start()
         t_rem.start()
-        # Block the main thread indefinitely; daemon threads exit with the process.
+        # Block main thread indefinitely.
         threading.Event().wait()
 
 elif SYSTEM == "Linux":
     import time
 
-    def _find_mount(
-        device_node: str, retries: int = 12, interval: float = 0.5
-    ) -> str | None:
-        # Poll /proc/mounts until the device appears.
-        # Needed because automount (udisks2 etc.) happens slightly after the udev event.
+    def _find_mount(device_node: str, retries: int = 12, interval: float = 0.5) -> str | None:
+        # Poll /proc/mounts until device appears.
         for _ in range(retries):
             try:
                 with open("/proc/mounts") as f:
@@ -556,7 +517,7 @@ elif SYSTEM == "Linux":
         return None
 
     def _is_usb(device) -> bool:
-        # Walk the device hierarchy to check for USB bus membership.
+        # Check for USB bus membership.
         d = device
         while d is not None:
             if d.get("ID_BUS") == "usb":
@@ -571,7 +532,7 @@ elif SYSTEM == "Linux":
         if not node:
             return
         label = device.get("ID_FS_LABEL") or device.get("ID_SERIAL") or device.sys_name
-        # Use the filesystem UUID as a stable volume serial on Linux.
+        # Use filesystem UUID as stable volume serial.
         serial = device.get("ID_FS_UUID")
         mount = _find_mount(node)
         if mount:
@@ -605,8 +566,7 @@ elif SYSTEM == "Linux":
         ).start()
         for action, device in mon:
             if action == "add":
-                # Run in a thread so the udev loop is never blocked while waiting
-                # for the automount to appear in /proc/mounts.
+                # Run in thread to avoid blocking udev loop.
                 threading.Thread(
                     target=_handle_add,
                     args=(device,),

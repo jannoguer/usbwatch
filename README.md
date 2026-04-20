@@ -35,17 +35,22 @@ All files are written to `logs/` next to the script.
 
 ### Manifest format
 
-Each line in a snapshot or delta file is tab-separated:
+**Snapshot files** (`snapshot_*.tsv.gz`) contain 4 tab-separated columns:
 
 ```
 <relpath>	<size>	<mtime>	<flag>
 ```
 
-- `flag`: `F` (file), `D` (directory), `L` (symlink)
+**Delta files** (`delta_*.tsv.gz`) contain 5 tab-separated columns, prefixing the same data with a change status (`+` added, `-` deleted, `~` modified):
+
+```
+<change>	<relpath>	<size>	<mtime>	<flag>
+```
+
+Field details:
 - `size`: byte count for files, `-` for directories and symlinks
 - `mtime`: UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format
-
-Delta files additionally prefix each line with `+` (added), `-` (deleted), or `~` (modified).
+- `flag`: `F` (file), `D` (directory), `L` (symlink)
 
 To read compressed files:
 
