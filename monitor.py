@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-import platform
 import logging
 import logging.handlers
+import os
+import platform
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -16,18 +16,25 @@ LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-def _parse_args() -> int:
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--depth", type=int, default=4)
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="USB monitor: logs drive contents and file-system activity to logs/."
+    )
+    p.add_argument(
+        "--depth",
+        type=int,
+        default=4,
+        help="Directory levels fully expanded in snapshots (default: 4).",
+    )
     args, _ = p.parse_known_args()
-    return args.depth
+    return args
 
 
-SNAPSHOT_MAX_DEPTH = _parse_args()
+_args = _parse_args()
+SNAPSHOT_MAX_DEPTH = _args.depth
 
-sys.stdout = open(os.devnull, "w")
-sys.stderr = open(os.devnull, "w")
-
+# Set up file logging BEFORE redirecting stdout/stderr so any setup failure
+# (e.g. unwritable logs/) is still visible on the real stderr.
 _root_handler = logging.handlers.RotatingFileHandler(
     str(LOGS_DIR / "monitor.log"),
     maxBytes=5 * 1024 * 1024,
@@ -38,6 +45,12 @@ _root_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(messag
 logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
+
+# Silence all console output now that logging is confirmed working.
+_devnull_out = open(os.devnull, "w")
+_devnull_err = open(os.devnull, "w")
+sys.stdout = _devnull_out
+sys.stderr = _devnull_err
 
 # drive_id -> {"observer": Observer, "ev_log": Logger, "fh": FileHandler}
 _active: dict = {}
