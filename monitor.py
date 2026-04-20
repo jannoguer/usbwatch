@@ -100,9 +100,20 @@ def _make_event_logger(label: str) -> tuple:
     return lg, fh
 
 
+def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None:
+    try:
+        ev_log.removeHandler(fh)
+        fh.close()
+        # Remove from the global logger registry to prevent accumulation over
+        # many plug/unplug cycles.
+        logging.Logger.manager.loggerDict.pop(ev_log.name, None)
+    except Exception:
+        pass
+
+
 def _start_watcher(mount: Path, label: str) -> tuple:
-    from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
 
     ev_log, fh = _make_event_logger(label)
 
@@ -168,11 +179,7 @@ def on_disconnect(drive_id: str) -> None:
         entry["observer"].join(timeout=5)
     except Exception:
         log.exception("Error stopping observer for %s", drive_id)
-    try:
-        entry["ev_log"].removeHandler(entry["fh"])
-        entry["fh"].close()
-    except Exception:
-        pass
+    _close_event_logger(entry["ev_log"], entry["fh"])
 
 
 SYSTEM = platform.system()
