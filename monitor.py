@@ -197,6 +197,8 @@ SYSTEM = platform.system()
 if SYSTEM == "Windows":
 
     def _wmi_thread(notification_type: str, callback) -> None:
+        import time
+
         import pythoncom
         import wmi
 
@@ -216,6 +218,7 @@ if SYSTEM == "Windows":
                     callback(disk)
                 except Exception:
                     log.exception("WMI event error (%s)", notification_type)
+                    time.sleep(1)
         finally:
             pythoncom.CoUninitialize()
 
@@ -227,13 +230,42 @@ if SYSTEM == "Windows":
     def _on_removal(disk) -> None:
         on_disconnect(disk.DeviceID)
 
+    def _scan_existing() -> None:
+        import pythoncom
+        import wmi
+
+        pythoncom.CoInitialize()
+        try:
+            c = wmi.WMI()
+            for disk in c.Win32_LogicalDisk(DriveType=2):
+                try:
+                    _on_arrival(disk)
+                except Exception:
+                    log.exception(
+                        "Error scanning existing drive %s",
+                        getattr(disk, "DeviceID", "?"),
+                    )
+        except Exception:
+            log.exception("Error during startup drive scan")
+        finally:
+            pythoncom.CoUninitialize()
+
     def run() -> None:
         log.info("Starting USB monitor (Windows/WMI)")
+        threading.Thread(
+            target=_scan_existing, name="scan-existing", daemon=True
+        ).start()
         t_add = threading.Thread(
-            target=_wmi_thread, args=("Creation", _on_arrival), daemon=True
+            target=_wmi_thread,
+            args=("Creation", _on_arrival),
+            name="wmi-add",
+            daemon=True,
         )
         t_rem = threading.Thread(
-            target=_wmi_thread, args=("Deletion", _on_removal), daemon=True
+            target=_wmi_thread,
+            args=("Deletion", _on_removal),
+            name="wmi-remove",
+            daemon=True,
         )
         t_add.start()
         t_rem.start()
@@ -273,12 +305,27 @@ elif SYSTEM == "Linux":
         if not _is_usb(device):
             return
         node = device.device_node
+        if not node:
+            return
         label = device.get("ID_FS_LABEL") or device.get("ID_SERIAL") or device.sys_name
         mount = _find_mount(node)
         if mount:
             on_connect(node, Path(mount), label)
         else:
             log.warning("No mount point found for %s within timeout", node)
+
+    def _scan_existing() -> None:
+        import pyudev
+
+        ctx = pyudev.Context()
+        for device in ctx.list_devices(subsystem="block", DEVTYPE="partition"):
+            if _is_usb(device):
+                threading.Thread(
+                    target=_handle_add,
+                    args=(device,),
+                    name=f"handle-add-{device.sys_name}",
+                    daemon=True,
+                ).start()
 
     def run() -> None:
         import pyudev
@@ -288,12 +335,18 @@ elif SYSTEM == "Linux":
         mon.filter_by(subsystem="block", device_type="partition")
         mon.start()
         log.info("Starting USB monitor (Linux/pyudev)")
+        threading.Thread(
+            target=_scan_existing, name="scan-existing", daemon=True
+        ).start()
         for action, device in mon:
             if action == "add":
                 # Run in a thread so the udev loop is never blocked while waiting
                 # for the automount to appear in /proc/mounts.
                 threading.Thread(
-                    target=_handle_add, args=(device,), daemon=True
+                    target=_handle_add,
+                    args=(device,),
+                    name=f"handle-add-{device.sys_name}",
+                    daemon=True,
                 ).start()
             elif action == "remove":
                 on_disconnect(device.device_node)
