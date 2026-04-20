@@ -159,6 +159,16 @@ def on_connect(drive_id: str, mount: Path, label: str) -> None:
     obs, ev_log, fh = _start_watcher(mount, label)
 
     with _lock:
+        if drive_id not in _active:
+            # Drive was disconnected while the watcher was starting; the slot was
+            # already popped by on_disconnect, so stop the orphaned observer now.
+            log.warning(
+                "Drive %s disconnected during setup; tearing down observer", drive_id
+            )
+            obs.stop()
+            obs.join(timeout=5)
+            _close_event_logger(ev_log, fh)
+            return
         _active[drive_id] = {"observer": obs, "ev_log": ev_log, "fh": fh}
 
 
