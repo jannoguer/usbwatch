@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import io
 import logging
 import logging.handlers
 import os
 import platform
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -20,18 +22,11 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="USB monitor: logs drive contents and file-system activity to logs/."
     )
-    p.add_argument(
-        "--depth",
-        type=int,
-        default=4,
-        help="Directory levels fully expanded in snapshots (default: 4).",
-    )
     args, _ = p.parse_known_args()
     return args
 
 
 _args = _parse_args()
-SNAPSHOT_MAX_DEPTH = _args.depth
 
 # Set up file logging BEFORE redirecting stdout/stderr so any setup failure
 # (e.g. unwritable logs/) is still visible on the real stderr.
@@ -66,26 +61,104 @@ def _safe(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))
 
 
+# Directory names to skip before recursing. These are system artefacts that
+# appear on Windows and macOS-formatted drives and are never useful to scan.
+_JUNK_DIRS: frozenset[str] = frozenset({
+    "System Volume Information",
+    "$RECYCLE.BIN",
+    ".Trashes",
+    ".fseventsd",
+    ".Spotlight-V100",
+    ".TemporaryItems",
+})
+
+
 def _snapshot(mount: Path, label: str) -> None:
-    path = LOGS_DIR / f"snapshot_{_safe(label)}_{_timestamp()}.txt"
+    """Walk *mount* with os.scandir and write a tab-separated manifest.
+
+    Output format — one line per entry::
+
+        <relpath>\t<size>\t<mtime_iso8601_utc>\t<flag>\n
+
+    where *flag* is ``D`` (directory), ``L`` (symlink), or ``F`` (file),
+    *size* is the byte count for files or ``-`` for dirs/symlinks, and
+    *mtime* is UTC in ``YYYY-MM-DDTHH:MM:SSZ`` format.
+
+    Design note — deliberately single-threaded:
+        USB mass-storage devices expose a single command queue. Running two or
+        more scanner threads causes seek thrash on FAT/exFAT and NTFS-over-USB
+        and is slower than a single ordered scan. Parallelism would only help
+        if we were hashing file contents, which is a separate concern.
+    """
+    path = LOGS_DIR / f"snapshot_{_safe(label)}_{_timestamp()}.tsv"
+    count = 0
     try:
-        with open(path, "w", encoding="utf-8", errors="replace") as f:
-            for root, dirs, files in os.walk(mount):
-                rel = os.path.relpath(root, mount)
-                depth = 0 if rel == "." else rel.count(os.sep) + 1
-                dirs.sort()
-                indent = "    " * depth
-                name = str(mount) if rel == "." else os.path.basename(root)
-                if depth > SNAPSHOT_MAX_DEPTH:
-                    f.write(f"{indent}{name}/ ({len(files)} files)\n")
-                    dirs.clear()
+        raw = open(path, "wb")  # noqa: WPS515 – closed via BufferedWriter
+        with io.BufferedWriter(raw, buffer_size=1 << 20) as buf:
+            stack: collections.deque[Path] = collections.deque([mount])
+            while stack:
+                current = stack.pop()
+                try:
+                    entries = list(os.scandir(current))
+                except PermissionError:
+                    log.warning("Permission denied scanning %s", current)
                     continue
-                f.write(f"{indent}{name}/\n")
-                for fname in sorted(files):
-                    f.write(f"{'    ' * (depth + 1)}{fname}\n")
-        log.info("Snapshot written: %s", path)
+                dirs_to_push: list[Path] = []
+                for entry in entries:
+                    # Skip symlinks to avoid reparse-point / junction loops.
+                    if entry.is_symlink():
+                        relpath = os.path.relpath(entry.path, mount)
+                        try:
+                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
+                            mtime = datetime.fromtimestamp(
+                                mtime_ts, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        except OSError:
+                            mtime = "-"
+                        line = f"{relpath}\t-\t{mtime}\tL\n"
+                        buf.write(line.encode("utf-8", errors="replace"))
+                        count += 1
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name in _JUNK_DIRS:
+                            continue
+                        dirs_to_push.append(Path(entry.path))
+                        relpath = os.path.relpath(entry.path, mount)
+                        try:
+                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
+                            mtime = datetime.fromtimestamp(
+                                mtime_ts, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        except OSError:
+                            mtime = "-"
+                        line = f"{relpath}\t-\t{mtime}\tD\n"
+                    else:
+                        relpath = os.path.relpath(entry.path, mount)
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            size = st.st_size
+                            mtime = datetime.fromtimestamp(
+                                st.st_mtime, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        except OSError:
+                            size = -1
+                            mtime = "-"
+                        line = f"{relpath}\t{size}\t{mtime}\tF\n"
+                    buf.write(line.encode("utf-8", errors="replace"))
+                    count += 1
+                # Push subdirectories in reverse-sorted order so the stack
+                # processes them in sorted order (leftmost first).
+                dirs_to_push.sort(key=lambda p: p.name, reverse=True)
+                stack.extend(dirs_to_push)
+                if count % 10_000 == 0 and count > 0:
+                    log.info("Snapshot progress: %d entries scanned", count)
+        log.info("Snapshot written: %s (%d entries)", path, count)
     except Exception:
         log.exception("Snapshot failed for %s", mount)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _make_event_logger(label: str) -> tuple:
