@@ -164,8 +164,8 @@ def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
         current = stack.pop()
         try:
             dir_entries = list(os.scandir(current))
-        except PermissionError:
-            log.warning("Permission denied scanning %s", current)
+        except OSError:
+            log.warning("Cannot scan %s", current)
             continue
         dirs_to_push: list[Path] = []
         for entry in dir_entries:
@@ -176,7 +176,7 @@ def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
                     mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
                         "%Y-%m-%dT%H:%M:%SZ"
                     )
-                except OSError:
+                except (OSError, ValueError, OverflowError):
                     mtime = "-"
                 entries_map[relpath] = ("-", mtime, "L")
                 continue
@@ -189,7 +189,7 @@ def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
                     mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
                         "%Y-%m-%dT%H:%M:%SZ"
                     )
-                except OSError:
+                except (OSError, ValueError, OverflowError):
                     mtime = "-"
                 entries_map[relpath] = ("-", mtime, "D")
             else:
@@ -199,7 +199,7 @@ def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
                     mtime = datetime.fromtimestamp(
                         st.st_mtime, tz=timezone.utc
                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                except OSError:
+                except (OSError, ValueError, OverflowError):
                     size = -1
                     mtime = "-"
                 entries_map[relpath] = (size, mtime, "F")
@@ -262,8 +262,8 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                 current = stack.pop()
                 try:
                     entries = list(os.scandir(current))
-                except PermissionError:
-                    log.warning("Permission denied scanning %s", current)
+                except OSError:
+                    log.warning("Cannot scan %s", current)
                     continue
                 dirs_to_push: list[Path] = []
                 for entry in entries:
@@ -275,7 +275,7 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                             mtime = datetime.fromtimestamp(
                                 mtime_ts, tz=timezone.utc
                             ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except OSError:
+                        except (OSError, ValueError, OverflowError):
                             mtime = "-"
                         line = f"{relpath}\t-\t{mtime}\tL\n"
                         buf.write(line.encode("utf-8", errors="replace"))
@@ -291,7 +291,7 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                             mtime = datetime.fromtimestamp(
                                 mtime_ts, tz=timezone.utc
                             ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except OSError:
+                        except (OSError, ValueError, OverflowError):
                             mtime = "-"
                         line = f"{relpath}\t-\t{mtime}\tD\n"
                     else:
@@ -302,7 +302,7 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                             mtime = datetime.fromtimestamp(
                                 st.st_mtime, tz=timezone.utc
                             ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except OSError:
+                        except (OSError, ValueError, OverflowError):
                             size = -1
                             mtime = "-"
                         line = f"{relpath}\t{size}\t{mtime}\tF\n"
@@ -313,7 +313,10 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                 stack.extend(dirs_to_push)
                 if count % 10_000 == 0 and count > 0:
                     log.info("Snapshot progress: %d entries scanned", count)
-            buf.flush()
+            try:
+                buf.flush()
+            except OSError:
+                log.warning("Flush error during snapshot of %s", mount)
         os.replace(tmp, final)
         log.info("Snapshot written: %s (%d entries)", final, count)
     except Exception:
