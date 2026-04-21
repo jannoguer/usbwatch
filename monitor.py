@@ -156,11 +156,16 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
     return manifest
 
 
-def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
+def _scan_entries(
+    mount: Path, cancel_evt: threading.Event
+) -> dict[str, tuple[int | str, str, str]]:
     """Scan directory and return file metadata map."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
     while stack:
+        if cancel_evt.is_set():
+            log.info("Scan cancelled for %s", mount)
+            return {}
         current = stack.pop()
         try:
             dir_entries = list(os.scandir(current))
@@ -209,7 +214,11 @@ def _scan_entries(mount: Path) -> dict[str, tuple[int | str, str, str]]:
 
 
 def _write_delta(
-    mount: Path, label: str, serial: str, old_manifest: dict[str, tuple[int | str, str]]
+    mount: Path,
+    label: str,
+    serial: str,
+    old_manifest: dict[str, tuple[int | str, str]],
+    cancel_evt: threading.Event,
 ) -> None:
     """Write differential changes against old manifest."""
     ts = _timestamp()
@@ -217,7 +226,10 @@ def _write_delta(
     tmp = final.with_suffix(".tsv.gz.tmp")
     count = 0
     try:
-        current_entries = _scan_entries(mount)
+        current_entries = _scan_entries(mount, cancel_evt)
+        if cancel_evt.is_set():
+            tmp.unlink(missing_ok=True)
+            return
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
             for relpath, (size, mtime, flag) in current_entries.items():
@@ -247,8 +259,15 @@ def _write_delta(
             pass
 
 
-def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
+def _snapshot(
+    mount: Path,
+    label: str,
+    serial: str | None = None,
+    cancel_evt: threading.Event | None = None,
+) -> None:
     """Write complete snapshot manifest."""
+    if cancel_evt is None:
+        cancel_evt = threading.Event()
     serial_tag = f"_{serial}" if serial else ""
     ts = _timestamp()
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
@@ -259,6 +278,9 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
             buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
             stack: collections.deque[Path] = collections.deque([mount])
             while stack:
+                if cancel_evt.is_set():
+                    log.info("Snapshot cancelled for %s", mount)
+                    break
                 current = stack.pop()
                 try:
                     entries = list(os.scandir(current))
@@ -317,6 +339,9 @@ def _snapshot(mount: Path, label: str, serial: str | None = None) -> None:
                 buf.flush()
             except OSError:
                 log.warning("Flush error during snapshot of %s", mount)
+        if cancel_evt.is_set():
+            tmp.unlink(missing_ok=True)
+            return
         os.replace(tmp, final)
         log.info("Snapshot written: %s (%d entries)", final, count)
     except Exception:
@@ -386,18 +411,21 @@ def _start_watcher(mount: Path, label: str) -> tuple:
     return obs, ev_log, fh
 
 
-def _do_snapshot(mount: Path, label: str, serial: str | None) -> None:
+def _do_snapshot(
+    mount: Path, label: str, serial: str | None, cancel_evt: threading.Event
+) -> None:
     """Execute snapshot or delta."""
     if serial:
         old = _load_manifest(serial)
         if old:
             log.info("Prior manifest found for serial %s; writing delta", serial)
-            _write_delta(mount, label, serial, old)
+            _write_delta(mount, label, serial, old, cancel_evt)
             return
-    _snapshot(mount, label, serial)
+    _snapshot(mount, label, serial, cancel_evt)
 
 
 def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None) -> None:
+    cancel_evt = threading.Event()
     with _lock:
         if drive_id in _active:
             return
@@ -415,7 +443,7 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
         serial or "unknown",
     )
     threading.Thread(
-        target=_do_snapshot, args=(mount, label, serial), daemon=True
+        target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
     ).start()
     obs, ev_log, fh = _start_watcher(mount, label)
 
@@ -425,6 +453,7 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
             log.warning(
                 "Drive %s disconnected during setup; tearing down observer", drive_id
             )
+            cancel_evt.set()
             obs.stop()
             obs.join(timeout=5)
             _close_event_logger(ev_log, fh)
@@ -434,6 +463,7 @@ def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None
             "ev_log": ev_log,
             "fh": fh,
             "serial": serial,
+            "cancel_evt": cancel_evt,
         }
 
 
@@ -449,6 +479,7 @@ def on_disconnect(drive_id: str) -> None:
         )
         return
     log.info("USB disconnected: id=%s", drive_id)
+    entry["cancel_evt"].set()
     try:
         entry["observer"].stop()
         entry["observer"].join(timeout=5)
