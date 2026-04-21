@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import ctypes
 import gzip
@@ -10,6 +11,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import signal
 import sys
 import threading
 from datetime import datetime, timezone
@@ -42,15 +44,48 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# Silence console output.
-_devnull_out = open(os.devnull, "w")
-_devnull_err = open(os.devnull, "w")
+# Silence console output; keep a real fallback for the logging lastResort handler.
+_devnull_fd = os.open(os.devnull, os.O_WRONLY)
+_devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
 sys.stdout = _devnull_out
-sys.stderr = _devnull_err
+# Do NOT redirect stderr — the logging lastResort handler writes there, and
+# silencing it would swallow any errors that occur before the log file opens.
+atexit.register(_devnull_out.close)
+atexit.register(lambda: os.close(_devnull_fd))
+
+# Global shutdown event — set by signal handlers to trigger clean exit.
+_shutdown = threading.Event()
+
+
+def _handle_signal(signum, frame) -> None:  # noqa: ARG001
+    """Signal handler: request graceful shutdown."""
+    log.info("Signal %d received; shutting down", signum)
+    _shutdown.set()
+
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
 # drive_id -> {"observer": Observer, "ev_log": Logger, "fh": FileHandler}
 _active: dict = {}
 _lock = threading.Lock()
+
+
+def _teardown_all() -> None:
+    """Stop all active observers and close event loggers on shutdown."""
+    with _lock:
+        items = list(_active.items())
+        _active.clear()
+    for drive_id, entry in items:
+        if not isinstance(entry, dict):
+            continue
+        log.info("Shutdown: stopping observer for %s", drive_id)
+        try:
+            entry["observer"].stop()
+            entry["observer"].join(timeout=5)
+        except Exception:
+            log.exception("Error stopping observer for %s on shutdown", drive_id)
+        _close_event_logger(entry["ev_log"], entry["fh"])
 
 
 def _timestamp() -> str:
@@ -496,8 +531,9 @@ if SYSTEM == "Windows":
         )
         t_add.start()
         t_rem.start()
-        # Block main thread indefinitely.
-        threading.Event().wait()
+        _shutdown.wait()
+        _teardown_all()
+        log.info("USB monitor stopped")
 
 elif SYSTEM == "Linux":
     import time
@@ -565,6 +601,8 @@ elif SYSTEM == "Linux":
             target=_scan_existing, name="scan-existing", daemon=True
         ).start()
         for action, device in mon:
+            if _shutdown.is_set():
+                break
             if action == "add":
                 # Run in thread to avoid blocking udev loop.
                 threading.Thread(
@@ -575,6 +613,8 @@ elif SYSTEM == "Linux":
                 ).start()
             elif action == "remove":
                 on_disconnect(device.device_node)
+        _teardown_all()
+        log.info("USB monitor stopped")
 
 else:
 
