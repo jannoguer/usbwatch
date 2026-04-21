@@ -427,7 +427,9 @@ def _do_snapshot(
     _snapshot(mount, label, serial, cancel_evt)
 
 
-def on_connect(drive_id: str, mount: Path, label: str, serial: str | None = None) -> None:
+def on_connect(
+    drive_id: str, mount: Path, label: str, serial: str | None = None
+) -> None:
     cancel_evt = threading.Event()
     with _lock:
         if drive_id in _active:
@@ -575,7 +577,9 @@ if SYSTEM == "Windows":
 elif SYSTEM == "Linux":
     import time
 
-    def _find_mount(device_node: str, retries: int = 12, interval: float = 0.5) -> str | None:
+    def _find_mount(
+        device_node: str, retries: int = 12, interval: float = 0.5
+    ) -> str | None:
         # Poll /proc/mounts until device appears.
         for _ in range(retries):
             try:
