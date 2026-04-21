@@ -69,3 +69,11 @@ python -c "import gzip, sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read
 - File system monitoring uses `watchdog` (inotify on Linux, ReadDirectoryChangesW on Windows), no polling.
 - On first connect a full manifest is written; on subsequent reconnects of the same volume a differential delta is produced instead, making reconnect scans significantly faster for large drives.
 - The scanner is deliberately single-threaded: USB mass-storage devices have a single command queue, so multiple threads cause seek thrash on FAT/exFAT and NTFS-over-USB.
+
+## To Do
+
+- [ ] Add an optional `--debug` flag to enable console output (in addition to log files).
+- [ ] Add an optional auto-sync feature to sync specific files or directories from the USB drive.
+- [ ] Add MacOS support.
+- [ ] Implement file hashing (SHA-256) for more robust change detection.
+- [ ] Implement optional webhook notifications for drive connections and file events (must use encrypted connections).
