@@ -89,7 +89,7 @@ def _teardown_all() -> None:
 
 
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def _safe(s: str) -> str:
@@ -140,7 +140,7 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
     try:
         with gzip.open(candidates[0], "rb") as gz:
             for raw_line in gz:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 parts = line.split("\t")
                 if len(parts) != 4:
                     continue
@@ -273,6 +273,7 @@ def _snapshot(
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
     tmp = final.with_suffix(".tsv.gz.tmp")
     count = 0
+    _heartbeat_count = 0
     try:
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
@@ -333,8 +334,10 @@ def _snapshot(
                 # Push subdirectories in reverse-sorted order.
                 dirs_to_push.sort(key=lambda p: p.name, reverse=True)
                 stack.extend(dirs_to_push)
-                if count % 10_000 == 0 and count > 0:
+                _heartbeat_count += count
+                if _heartbeat_count >= 10_000:
                     log.info("Snapshot progress: %d entries scanned", count)
+                    _heartbeat_count = 0
             try:
                 buf.flush()
             except OSError:
