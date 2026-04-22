@@ -383,7 +383,13 @@ def _make_event_logger(label: str) -> tuple:
 def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None:
     try:
         ev_log.removeHandler(fh)
+    except Exception:
+        pass
+    try:
         fh.close()
+    except Exception:
+        pass
+    try:
         # Remove from global logger registry.
         logging.Logger.manager.loggerDict.pop(ev_log.name, None)
     except Exception:
