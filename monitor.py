@@ -79,13 +79,18 @@ def _teardown_all() -> None:
     for drive_id, entry in items:
         if not isinstance(entry, dict):
             continue
+        if "cancel_evt" in entry:
+            entry["cancel_evt"].set()
+        if entry.get("status") == "connecting":
+            continue
         log.info("Shutdown: stopping observer for %s", drive_id)
         try:
             entry["observer"].stop()
             entry["observer"].join(timeout=5)
         except Exception:
             log.exception("Error stopping observer for %s on shutdown", drive_id)
-        _close_event_logger(entry["ev_log"], entry["fh"])
+        if "ev_log" in entry and "fh" in entry:
+            _close_event_logger(entry["ev_log"], entry["fh"])
 
 
 def _timestamp() -> str:
@@ -453,7 +458,7 @@ def on_connect(
     with _lock:
         if drive_id in _active:
             return
-        _active[drive_id] = None  # reserve slot; prevents duplicate connect races
+        _active[drive_id] = {"cancel_evt": cancel_evt, "status": "connecting"}
 
     # Resolve volume serial.
     if serial is None:
@@ -472,7 +477,8 @@ def on_connect(
     obs, ev_log, fh = _start_watcher(mount, label)
 
     with _lock:
-        if drive_id not in _active:
+        entry = _active.get(drive_id)
+        if entry is None or entry.get("cancel_evt") is not cancel_evt:
             # Teardown observer if drive disconnected during setup.
             log.warning(
                 "Drive %s disconnected during setup; tearing down observer", drive_id
@@ -488,28 +494,31 @@ def on_connect(
             "fh": fh,
             "serial": serial,
             "cancel_evt": cancel_evt,
+            "status": "connected",
         }
 
 
 def on_disconnect(drive_id: str) -> None:
     with _lock:
         entry = _active.pop(drive_id, None)
-    if entry is None:
+    if not entry:
         return
-    if not isinstance(entry, dict):
+    log.info("USB disconnected: id=%s", drive_id)
+    if "cancel_evt" in entry:
+        entry["cancel_evt"].set()
+    if entry.get("status") == "connecting":
         log.warning(
             "Disconnect during connect setup for %s; watcher may not have started",
             drive_id,
         )
         return
-    log.info("USB disconnected: id=%s", drive_id)
-    entry["cancel_evt"].set()
     try:
         entry["observer"].stop()
         entry["observer"].join(timeout=5)
     except Exception:
         log.exception("Error stopping observer for %s", drive_id)
-    _close_event_logger(entry["ev_log"], entry["fh"])
+    if "ev_log" in entry and "fh" in entry:
+        _close_event_logger(entry["ev_log"], entry["fh"])
 
 
 SYSTEM = platform.system()
