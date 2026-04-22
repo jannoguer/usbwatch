@@ -233,23 +233,29 @@ def _write_delta(
             return
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
-            for relpath, (size, mtime, flag) in current_entries.items():
-                if relpath not in old_manifest:
-                    line = f"+\t{relpath}\t{size}\t{mtime}\t{flag}\n"
-                else:
-                    old_size, old_mtime = old_manifest[relpath]
-                    if size != old_size or mtime != old_mtime:
-                        line = f"~\t{relpath}\t{size}\t{mtime}\t{flag}\n"
+            try:
+                for relpath, (size, mtime, flag) in current_entries.items():
+                    if relpath not in old_manifest:
+                        line = f"+\t{relpath}\t{size}\t{mtime}\t{flag}\n"
                     else:
-                        continue
-                buf.write(line.encode("utf-8", errors="replace"))
-                count += 1
-            for relpath in old_manifest:
-                if relpath not in current_entries:
-                    line = f"-\t{relpath}\t-\t-\t-\n"
+                        old_size, old_mtime = old_manifest[relpath]
+                        if size != old_size or mtime != old_mtime:
+                            line = f"~\t{relpath}\t{size}\t{mtime}\t{flag}\n"
+                        else:
+                            continue
                     buf.write(line.encode("utf-8", errors="replace"))
                     count += 1
-            buf.flush()
+                for relpath in old_manifest:
+                    if relpath not in current_entries:
+                        line = f"-\t{relpath}\t-\t-\t-\n"
+                        buf.write(line.encode("utf-8", errors="replace"))
+                        count += 1
+                buf.flush()
+            finally:
+                try:
+                    buf.detach()
+                except Exception:
+                    pass
         os.replace(tmp, final)
         log.info("Delta written: %s (%d changes)", final, count)
     except Exception:
@@ -278,71 +284,77 @@ def _snapshot(
     try:
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
-            stack: collections.deque[Path] = collections.deque([mount])
-            while stack:
-                if cancel_evt.is_set():
-                    log.info("Snapshot cancelled for %s", mount)
-                    break
-                current = stack.pop()
-                try:
-                    entries = list(os.scandir(current))
-                except OSError:
-                    log.warning("Cannot scan %s", current)
-                    continue
-                dirs_to_push: list[Path] = []
-                for entry in entries:
-                    # Skip symlinks to avoid loops.
-                    if entry.is_symlink():
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                            mtime = datetime.fromtimestamp(
-                                mtime_ts, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            mtime = "-"
-                        line = f"{relpath}\t-\t{mtime}\tL\n"
+            try:
+                stack: collections.deque[Path] = collections.deque([mount])
+                while stack:
+                    if cancel_evt.is_set():
+                        log.info("Snapshot cancelled for %s", mount)
+                        break
+                    current = stack.pop()
+                    try:
+                        entries = list(os.scandir(current))
+                    except OSError:
+                        log.warning("Cannot scan %s", current)
+                        continue
+                    dirs_to_push: list[Path] = []
+                    for entry in entries:
+                        # Skip symlinks to avoid loops.
+                        if entry.is_symlink():
+                            relpath = os.path.relpath(entry.path, mount)
+                            try:
+                                mtime_ts = entry.stat(follow_symlinks=False).st_mtime
+                                mtime = datetime.fromtimestamp(
+                                    mtime_ts, tz=timezone.utc
+                                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except (OSError, ValueError, OverflowError):
+                                mtime = "-"
+                            line = f"{relpath}\t-\t{mtime}\tL\n"
+                            buf.write(line.encode("utf-8", errors="replace"))
+                            count += 1
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name in _JUNK_DIRS:
+                                continue
+                            dirs_to_push.append(Path(entry.path))
+                            relpath = os.path.relpath(entry.path, mount)
+                            try:
+                                mtime_ts = entry.stat(follow_symlinks=False).st_mtime
+                                mtime = datetime.fromtimestamp(
+                                    mtime_ts, tz=timezone.utc
+                                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except (OSError, ValueError, OverflowError):
+                                mtime = "-"
+                            line = f"{relpath}\t-\t{mtime}\tD\n"
+                        else:
+                            relpath = os.path.relpath(entry.path, mount)
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                                size = st.st_size
+                                mtime = datetime.fromtimestamp(
+                                    st.st_mtime, tz=timezone.utc
+                                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except (OSError, ValueError, OverflowError):
+                                size = -1
+                                mtime = "-"
+                            line = f"{relpath}\t{size}\t{mtime}\tF\n"
                         buf.write(line.encode("utf-8", errors="replace"))
                         count += 1
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name in _JUNK_DIRS:
-                            continue
-                        dirs_to_push.append(Path(entry.path))
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                            mtime = datetime.fromtimestamp(
-                                mtime_ts, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            mtime = "-"
-                        line = f"{relpath}\t-\t{mtime}\tD\n"
-                    else:
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            st = entry.stat(follow_symlinks=False)
-                            size = st.st_size
-                            mtime = datetime.fromtimestamp(
-                                st.st_mtime, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            size = -1
-                            mtime = "-"
-                        line = f"{relpath}\t{size}\t{mtime}\tF\n"
-                    buf.write(line.encode("utf-8", errors="replace"))
-                    count += 1
-                # Push subdirectories in reverse-sorted order.
-                dirs_to_push.sort(key=lambda p: p.name, reverse=True)
-                stack.extend(dirs_to_push)
-                _heartbeat_count += count
-                if _heartbeat_count >= 10_000:
-                    log.info("Snapshot progress: %d entries scanned", count)
-                    _heartbeat_count = 0
-            try:
-                buf.flush()
-            except OSError:
-                log.warning("Flush error during snapshot of %s", mount)
+                    # Push subdirectories in reverse-sorted order.
+                    dirs_to_push.sort(key=lambda p: p.name, reverse=True)
+                    stack.extend(dirs_to_push)
+                    _heartbeat_count += count
+                    if _heartbeat_count >= 10_000:
+                        log.info("Snapshot progress: %d entries scanned", count)
+                        _heartbeat_count = 0
+                try:
+                    buf.flush()
+                except OSError:
+                    log.warning("Flush error during snapshot of %s", mount)
+            finally:
+                try:
+                    buf.detach()
+                except Exception:
+                    pass
         if cancel_evt.is_set():
             tmp.unlink(missing_ok=True)
             return
