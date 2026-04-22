@@ -589,7 +589,8 @@ if SYSTEM == "Windows":
         )
         t_add.start()
         t_rem.start()
-        _shutdown.wait()
+        while not _shutdown.wait(timeout=1.0):
+            pass
         _teardown_all()
         log.info("USB monitor stopped")
 
@@ -660,9 +661,11 @@ elif SYSTEM == "Linux":
         threading.Thread(
             target=_scan_existing, name="scan-existing", daemon=True
         ).start()
-        for action, device in mon:
-            if _shutdown.is_set():
-                break
+        while not _shutdown.is_set():
+            device = mon.poll(timeout=1.0)
+            if device is None:
+                continue
+            action = device.action
             if action == "add":
                 # Run in thread to avoid blocking udev loop.
                 threading.Thread(
