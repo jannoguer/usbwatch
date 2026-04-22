@@ -174,7 +174,8 @@ def _scan_entries(
             return {}
         current = stack.pop()
         try:
-            dir_entries = list(os.scandir(current))
+            with os.scandir(current) as it:
+                dir_entries = list(it)
         except OSError:
             log.warning("Cannot scan %s", current)
             continue
@@ -287,7 +288,8 @@ def _snapshot(
                         break
                     current = stack.pop()
                     try:
-                        entries = list(os.scandir(current))
+                        with os.scandir(current) as it:
+                            entries = list(it)
                     except OSError:
                         log.warning("Cannot scan %s", current)
                         continue
