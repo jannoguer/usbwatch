@@ -89,8 +89,9 @@ def _teardown_all() -> None:
             continue
         log.info("Shutdown: stopping observer for %s", drive_id)
         try:
-            entry["observer"].stop()
-            entry["observer"].join(timeout=5)
+            if entry.get("observer"):
+                entry["observer"].stop()
+                entry["observer"].join(timeout=5)
         except Exception:
             log.exception("Error stopping observer for %s on shutdown", drive_id)
         if "ev_log" in entry and "fh" in entry:
@@ -100,12 +101,20 @@ def _teardown_all() -> None:
 
 
 def _timestamp() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
 
 
 def _safe(s: str) -> str:
     """Strip characters unsafe for filenames."""
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))
+
+
+def _escape_path(p: str) -> str:
+    return p.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def _unescape_path(p: str) -> str:
+    return p.replace("\\t", "\t").replace("\\r", "\r").replace("\\n", "\n").replace("\\\\", "\\")
 
 
 # System directories to skip.
@@ -119,6 +128,7 @@ _JUNK_DIRS: frozenset[str] = frozenset(
         ".TemporaryItems",
     }
 )
+_JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 
 
 def _volume_serial(mount: Path) -> str | None:
@@ -152,15 +162,15 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
                 for raw_line in gz:
                     line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                     parts = line.split("\t")
-                    if len(parts) != 4:
+                    if len(parts) != 5:
                         continue
-                    relpath, size_s, mtime, _ = parts
+                    relpath, size_s, mtime, flag = parts
                     size: int | str = (
                         int(size_s)
                         if size_s.lstrip("-").isdigit() and size_s != "-"
                         else "-"
                     )
-                    manifest[relpath] = (size, mtime)
+                    manifest[_unescape_path(relpath)] = (size, mtime, flag)
             return manifest
         except Exception:
             log.exception("Failed to load manifest %s", cand)
@@ -198,7 +208,7 @@ def _scan_entries(
                 entries_map[relpath] = ("-", mtime, "L")
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if entry.name in _JUNK_DIRS:
+                if entry.name.upper() in _JUNK_DIRS_UPPER:
                     continue
                 dirs_to_push.append(Path(entry.path))
                 try:
@@ -244,19 +254,20 @@ def _write_delta(
             return
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             for relpath, (size, mtime, flag) in current_entries.items():
+                enc_relpath = _escape_path(relpath)
                 if relpath not in old_manifest:
-                    line = f"+\t{relpath}\t{size}\t{mtime}\t{flag}\n"
+                    line = f"+\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
                 else:
-                    old_size, old_mtime = old_manifest[relpath]
-                    if size != old_size or mtime != old_mtime:
-                        line = f"~\t{relpath}\t{size}\t{mtime}\t{flag}\n"
+                    old_size, old_mtime, old_flag = old_manifest[relpath]
+                    if size != old_size or mtime != old_mtime or flag != old_flag:
+                        line = f"~\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
                     else:
                         continue
                 gz.write(line.encode("utf-8", errors="replace"))
                 count += 1
             for relpath in old_manifest:
                 if relpath not in current_entries:
-                    line = f"-\t{relpath}\t-\t-\t-\n"
+                    line = f"-\t{_escape_path(relpath)}\t-\t-\t-\n"
                     gz.write(line.encode("utf-8", errors="replace"))
                     count += 1
         os.replace(tmp, final)
@@ -310,12 +321,12 @@ def _snapshot(
                             ).strftime("%Y-%m-%dT%H:%M:%SZ")
                         except (OSError, ValueError, OverflowError):
                             mtime = "-"
-                        line = f"{relpath}\t-\t{mtime}\tL\n"
+                        line = f"{_escape_path(relpath)}\t-\t{mtime}\tL\n"
                         gz.write(line.encode("utf-8", errors="replace"))
                         count += 1
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        if entry.name in _JUNK_DIRS:
+                        if entry.name.upper() in _JUNK_DIRS_UPPER:
                             continue
                         dirs_to_push.append(Path(entry.path))
                         relpath = os.path.relpath(entry.path, mount)
@@ -326,7 +337,7 @@ def _snapshot(
                             ).strftime("%Y-%m-%dT%H:%M:%SZ")
                         except (OSError, ValueError, OverflowError):
                             mtime = "-"
-                        line = f"{relpath}\t-\t{mtime}\tD\n"
+                        line = f"{_escape_path(relpath)}\t-\t{mtime}\tD\n"
                     else:
                         relpath = os.path.relpath(entry.path, mount)
                         try:
@@ -338,16 +349,16 @@ def _snapshot(
                         except (OSError, ValueError, OverflowError):
                             size = -1
                             mtime = "-"
-                        line = f"{relpath}\t{size}\t{mtime}\tF\n"
+                        line = f"{_escape_path(relpath)}\t{size}\t{mtime}\tF\n"
                     gz.write(line.encode("utf-8", errors="replace"))
                     count += 1
                 # Push subdirectories in reverse-sorted order.
-                    dirs_to_push.sort(key=lambda p: p.name, reverse=True)
-                    stack.extend(dirs_to_push)
-                    _heartbeat_count += count
-                    if _heartbeat_count >= 10_000:
-                        log.info("Snapshot progress: %d entries scanned", count)
-                        _heartbeat_count = 0
+                dirs_to_push.sort(key=lambda p: p.name, reverse=True)
+                stack.extend(dirs_to_push)
+                _heartbeat_count += count
+                if _heartbeat_count >= 10_000:
+                    log.info("Snapshot progress: %d entries scanned", count)
+                    _heartbeat_count = 0
         if cancel_evt.is_set():
             tmp.unlink(missing_ok=True)
             return
@@ -380,11 +391,6 @@ def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None
         pass
     try:
         fh.close()
-    except Exception:
-        pass
-    try:
-        # Remove from global logger registry.
-        logging.Logger.manager.loggerDict.pop(ev_log.name, None)
     except Exception:
         pass
 
@@ -420,9 +426,13 @@ def _start_watcher(mount: Path, label: str) -> tuple:
             )
 
     obs = Observer()
-    obs.schedule(_Handler(), str(mount), recursive=True)
-    obs.start()
-    log.info("FS monitor started: %s", mount)
+    try:
+        obs.schedule(_Handler(), str(mount), recursive=True)
+        obs.start()
+        log.info("FS monitor started: %s", mount)
+    except OSError:
+        log.warning("Failed to start FS monitor for %s", mount)
+        return None, ev_log, fh
     return obs, ev_log, fh
 
 
@@ -477,8 +487,9 @@ def on_connect(
                 "Drive %s disconnected during setup; tearing down observer", drive_id
             )
             cancel_evt.set()
-            obs.stop()
-            obs.join(timeout=5)
+            if obs:
+                obs.stop()
+                obs.join(timeout=5)
             _close_event_logger(ev_log, fh)
             return
         _active[drive_id] = {
@@ -507,8 +518,9 @@ def on_disconnect(drive_id: str) -> None:
         )
         return
     try:
-        entry["observer"].stop()
-        entry["observer"].join(timeout=5)
+        if entry.get("observer"):
+            entry["observer"].stop()
+            entry["observer"].join(timeout=5)
     except Exception:
         log.exception("Error stopping observer for %s", drive_id)
     if "ev_log" in entry and "fh" in entry:
@@ -528,17 +540,18 @@ if SYSTEM == "Windows":
         # Initialize COM.
         pythoncom.CoInitialize()
         try:
-            c = wmi.WMI()
-            # DriveType 2 == Removable
-            watcher = c.watch_for(
-                notification_type=notification_type,
-                wmi_class="Win32_LogicalDisk",
-                DriveType=2,
-            )
             while True:
                 try:
-                    disk = watcher()
-                    callback(disk)
+                    c = wmi.WMI()
+                    # DriveType 2 == Removable
+                    watcher = c.watch_for(
+                        notification_type=notification_type,
+                        wmi_class="Win32_LogicalDisk",
+                        DriveType=2,
+                    )
+                    while True:
+                        disk = watcher()
+                        callback(disk)
                 except Exception:
                     log.exception("WMI event error (%s)", notification_type)
                     time.sleep(1)
