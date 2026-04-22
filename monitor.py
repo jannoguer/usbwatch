@@ -49,8 +49,8 @@ _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
 sys.stdout = _devnull_out
 # Do NOT redirect stderr — the logging lastResort handler writes there, and
 # silencing it would swallow any errors that occur before the log file opens.
-atexit.register(_devnull_out.close)
 atexit.register(lambda: os.close(_devnull_fd))
+atexit.register(_devnull_out.close)
 
 # Global shutdown event — set by signal handlers to trigger clean exit.
 _shutdown = threading.Event()
@@ -354,7 +354,7 @@ def _snapshot(
                 # Push subdirectories in reverse-sorted order.
                 dirs_to_push.sort(key=lambda p: p.name, reverse=True)
                 stack.extend(dirs_to_push)
-                _heartbeat_count += count
+                _heartbeat_count += len(entries)
                 if _heartbeat_count >= 10_000:
                     log.info("Snapshot progress: %d entries scanned", count)
                     _heartbeat_count = 0
