@@ -59,7 +59,6 @@ _shutdown = threading.Event()
 
 def _handle_signal(signum, frame) -> None:  # noqa: ARG001
     """Signal handler: request graceful shutdown."""
-    log.info("Signal %d received; shutting down", signum)
     _shutdown.set()
 
 
