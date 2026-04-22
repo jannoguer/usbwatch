@@ -153,6 +153,7 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str]]:
                 manifest[relpath] = (size, mtime)
     except Exception:
         log.exception("Failed to load manifest %s", candidates[0])
+        return {}
     return manifest
 
 
