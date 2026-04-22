@@ -237,9 +237,7 @@ def _write_delta(
             tmp.unlink(missing_ok=True)
             return
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
-            try:
-                for relpath, (size, mtime, flag) in current_entries.items():
+            for relpath, (size, mtime, flag) in current_entries.items():
                     if relpath not in old_manifest:
                         line = f"+\t{relpath}\t{size}\t{mtime}\t{flag}\n"
                     else:
@@ -248,19 +246,13 @@ def _write_delta(
                             line = f"~\t{relpath}\t{size}\t{mtime}\t{flag}\n"
                         else:
                             continue
-                    buf.write(line.encode("utf-8", errors="replace"))
+                    gz.write(line.encode("utf-8", errors="replace"))
                     count += 1
                 for relpath in old_manifest:
                     if relpath not in current_entries:
                         line = f"-\t{relpath}\t-\t-\t-\n"
-                        buf.write(line.encode("utf-8", errors="replace"))
+                        gz.write(line.encode("utf-8", errors="replace"))
                         count += 1
-                buf.flush()
-            finally:
-                try:
-                    buf.detach()
-                except Exception:
-                    pass
         os.replace(tmp, final)
         log.info("Delta written: %s (%d changes)", final, count)
     except Exception:
@@ -288,9 +280,7 @@ def _snapshot(
     _heartbeat_count = 0
     try:
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            buf = io.BufferedWriter(gz, buffer_size=1 << 20)  # type: ignore[arg-type]
-            try:
-                stack: collections.deque[Path] = collections.deque([mount])
+            stack: collections.deque[Path] = collections.deque([mount])
                 while stack:
                     if cancel_evt.is_set():
                         log.info("Snapshot cancelled for %s", mount)
@@ -314,7 +304,7 @@ def _snapshot(
                             except (OSError, ValueError, OverflowError):
                                 mtime = "-"
                             line = f"{relpath}\t-\t{mtime}\tL\n"
-                            buf.write(line.encode("utf-8", errors="replace"))
+                            gz.write(line.encode("utf-8", errors="replace"))
                             count += 1
                             continue
                         if entry.is_dir(follow_symlinks=False):
@@ -342,7 +332,7 @@ def _snapshot(
                                 size = -1
                                 mtime = "-"
                             line = f"{relpath}\t{size}\t{mtime}\tF\n"
-                        buf.write(line.encode("utf-8", errors="replace"))
+                        gz.write(line.encode("utf-8", errors="replace"))
                         count += 1
                     # Push subdirectories in reverse-sorted order.
                     dirs_to_push.sort(key=lambda p: p.name, reverse=True)
@@ -351,15 +341,6 @@ def _snapshot(
                     if _heartbeat_count >= 10_000:
                         log.info("Snapshot progress: %d entries scanned", count)
                         _heartbeat_count = 0
-                try:
-                    buf.flush()
-                except OSError:
-                    log.warning("Flush error during snapshot of %s", mount)
-            finally:
-                try:
-                    buf.detach()
-                except Exception:
-                    pass
         if cancel_evt.is_set():
             tmp.unlink(missing_ok=True)
             return
