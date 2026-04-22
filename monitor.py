@@ -55,6 +55,7 @@ atexit.register(lambda: os.close(_devnull_fd))
 
 # Global shutdown event — set by signal handlers to trigger clean exit.
 _shutdown = threading.Event()
+_is_shutting_down = False
 
 
 def _handle_signal(signum, frame) -> None:  # noqa: ARG001
@@ -72,7 +73,9 @@ _lock = threading.Lock()
 
 def _teardown_all() -> None:
     """Stop all active observers and close event loggers on shutdown."""
+    global _is_shutting_down
     with _lock:
+        _is_shutting_down = True
         items = list(_active.items())
         _active.clear()
     for drive_id, entry in items:
@@ -81,6 +84,8 @@ def _teardown_all() -> None:
         if "cancel_evt" in entry:
             entry["cancel_evt"].set()
         if entry.get("status") == "connecting":
+            if "snapshot_thread" in entry:
+                entry["snapshot_thread"].join(timeout=10)
             continue
         log.info("Shutdown: stopping observer for %s", drive_id)
         try:
@@ -90,6 +95,8 @@ def _teardown_all() -> None:
             log.exception("Error stopping observer for %s on shutdown", drive_id)
         if "ev_log" in entry and "fh" in entry:
             _close_event_logger(entry["ev_log"], entry["fh"])
+        if "snapshot_thread" in entry:
+            entry["snapshot_thread"].join(timeout=10)
 
 
 def _timestamp() -> str:
@@ -436,15 +443,22 @@ def _do_snapshot(
 def on_connect(
     drive_id: str, mount: Path, label: str, serial: str | None = None
 ) -> None:
-    cancel_evt = threading.Event()
-    with _lock:
-        if drive_id in _active:
-            return
-        _active[drive_id] = {"cancel_evt": cancel_evt, "status": "connecting"}
-
-    # Resolve volume serial.
     if serial is None:
         serial = _volume_serial(mount)
+
+    cancel_evt = threading.Event()
+    t_snap = threading.Thread(
+        target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
+    )
+    
+    with _lock:
+        if _is_shutting_down or drive_id in _active:
+            return
+        _active[drive_id] = {
+            "cancel_evt": cancel_evt,
+            "status": "connecting",
+            "snapshot_thread": t_snap,
+        }
 
     log.info(
         "USB connected: id=%s mount=%s label=%s serial=%s",
@@ -453,9 +467,7 @@ def on_connect(
         label,
         serial or "unknown",
     )
-    threading.Thread(
-        target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
-    ).start()
+    t_snap.start()
     obs, ev_log, fh = _start_watcher(mount, label)
 
     with _lock:
@@ -477,6 +489,7 @@ def on_connect(
             "serial": serial,
             "cancel_evt": cancel_evt,
             "status": "connected",
+            "snapshot_thread": t_snap,
         }
 
 
