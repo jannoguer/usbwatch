@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
+
 import atexit
 import collections
 import ctypes
@@ -20,16 +20,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="USB monitor: logs drive contents and file-system activity to logs/."
-    )
-    args, _ = p.parse_known_args()
-    return args
-
-
-_args = _parse_args()
 
 # Set up file logging before redirecting stdout/stderr.
 _root_handler = logging.handlers.RotatingFileHandler(
@@ -188,10 +178,19 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
     return {}
 
 
+def _fmt_time(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (OSError, ValueError, OverflowError):
+        return "-"
+
+
 def _scan_entries(
     mount: Path, cancel_evt: threading.Event
 ) -> dict[str, tuple[int | str, str, str]]:
-    """Scan directory and return file metadata map."""
+    """Return a path-to-metadata map of the directory tree."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
     heartbeat = 0
@@ -209,38 +208,26 @@ def _scan_entries(
         dirs_to_push: list[Path] = []
         for entry in dir_entries:
             relpath = os.path.relpath(entry.path, mount)
-            if entry.is_symlink():
-                try:
-                    mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                    mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    )
-                except (OSError, ValueError, OverflowError):
-                    mtime = "-"
-                entries_map[relpath] = ("-", mtime, "L")
+            is_symlink = entry.is_symlink()
+            is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+
+            if is_dir and entry.name.upper() in _JUNK_DIRS_UPPER:
                 continue
-            if entry.is_dir(follow_symlinks=False):
-                if entry.name.upper() in _JUNK_DIRS_UPPER:
-                    continue
+
+            try:
+                st = entry.stat(follow_symlinks=False)
+                mtime = _fmt_time(st.st_mtime)
+            except OSError:
+                st = None
+                mtime = "-"
+
+            if is_symlink:
+                entries_map[relpath] = ("-", mtime, "L")
+            elif is_dir:
                 dirs_to_push.append(Path(entry.path))
-                try:
-                    mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                    mtime = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    )
-                except (OSError, ValueError, OverflowError):
-                    mtime = "-"
                 entries_map[relpath] = ("-", mtime, "D")
             else:
-                try:
-                    st = entry.stat(follow_symlinks=False)
-                    size: int | str = st.st_size
-                    mtime = datetime.fromtimestamp(
-                        st.st_mtime, tz=timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                except (OSError, ValueError, OverflowError):
-                    size = -1
-                    mtime = "-"
+                size = st.st_size if st else -1
                 entries_map[relpath] = (size, mtime, "F")
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
@@ -251,6 +238,22 @@ def _scan_entries(
     return entries_map
 
 
+def _write_atomic_gz(final: Path, lines_iter) -> int:
+    """Write lines to a gzip file atomically using a temporary file."""
+    tmp = final.with_suffix(".tsv.gz.tmp")
+    count = 0
+    try:
+        with gzip.open(tmp, "wb", compresslevel=1) as gz:
+            for line in lines_iter:
+                gz.write(line.encode("utf-8", errors="replace"))
+                count += 1
+        os.replace(tmp, final)
+        return count
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _write_delta(
     mount: Path,
     label: str,
@@ -259,41 +262,31 @@ def _write_delta(
     cancel_evt: threading.Event,
 ) -> None:
     """Write differential changes against old manifest."""
+    current_entries = _scan_entries(mount, cancel_evt)
+    if cancel_evt.is_set():
+        return
+
     ts = _timestamp()
     final = LOGS_DIR / f"delta_{_safe(label)}_{serial}_{ts}.tsv.gz"
-    tmp = final.with_suffix(".tsv.gz.tmp")
-    count = 0
+
+    def _lines():
+        for relpath, (size, mtime, flag) in current_entries.items():
+            enc_relpath = _escape_path(relpath)
+            if relpath not in old_manifest:
+                yield f"+\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
+            else:
+                old_size, old_mtime, old_flag = old_manifest[relpath]
+                if size != old_size or mtime != old_mtime or flag != old_flag:
+                    yield f"~\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
+        for relpath in old_manifest:
+            if relpath not in current_entries:
+                yield f"-\t{_escape_path(relpath)}\t-\t-\t-\n"
+
     try:
-        current_entries = _scan_entries(mount, cancel_evt)
-        if cancel_evt.is_set():
-            tmp.unlink(missing_ok=True)
-            return
-        with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            for relpath, (size, mtime, flag) in current_entries.items():
-                enc_relpath = _escape_path(relpath)
-                if relpath not in old_manifest:
-                    line = f"+\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
-                else:
-                    old_size, old_mtime, old_flag = old_manifest[relpath]
-                    if size != old_size or mtime != old_mtime or flag != old_flag:
-                        line = f"~\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
-                    else:
-                        continue
-                gz.write(line.encode("utf-8", errors="replace"))
-                count += 1
-            for relpath in old_manifest:
-                if relpath not in current_entries:
-                    line = f"-\t{_escape_path(relpath)}\t-\t-\t-\n"
-                    gz.write(line.encode("utf-8", errors="replace"))
-                    count += 1
-        os.replace(tmp, final)
+        count = _write_atomic_gz(final, _lines())
         log.info("Delta written: %s (%d changes)", final, count)
     except Exception:
         log.exception("Delta failed for %s", mount)
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def _snapshot(
@@ -303,31 +296,24 @@ def _snapshot(
     cancel_evt: threading.Event | None = None,
 ) -> None:
     """Write complete snapshot manifest."""
-    if cancel_evt is None:
-        cancel_evt = threading.Event()
+    cancel_evt = cancel_evt or threading.Event()
+    entries_map = _scan_entries(mount, cancel_evt)
+    if cancel_evt.is_set():
+        return
+
     serial_tag = f"_{serial}" if serial else ""
     ts = _timestamp()
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
-    tmp = final.with_suffix(".tsv.gz.tmp")
-    count = 0
+
+    def _lines():
+        for relpath, (size, mtime, flag) in entries_map.items():
+            yield f"{_escape_path(relpath)}\t{size}\t{mtime}\t{flag}\n"
+
     try:
-        entries_map = _scan_entries(mount, cancel_evt)
-        if cancel_evt.is_set():
-            tmp.unlink(missing_ok=True)
-            return
-        with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            for relpath, (size, mtime, flag) in entries_map.items():
-                line = f"{_escape_path(relpath)}\t{size}\t{mtime}\t{flag}\n"
-                gz.write(line.encode("utf-8", errors="replace"))
-                count += 1
-        os.replace(tmp, final)
+        count = _write_atomic_gz(final, _lines())
         log.info("Snapshot written: %s (%d entries)", final, count)
     except Exception:
         log.exception("Snapshot failed for %s", mount)
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def _make_event_logger(label: str) -> tuple:
