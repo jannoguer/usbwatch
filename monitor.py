@@ -184,6 +184,7 @@ def _scan_entries(
     """Scan directory and return file metadata map."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
+    heartbeat = 0
     while stack:
         if cancel_evt.is_set():
             log.info("Scan cancelled for %s", mount)
@@ -233,6 +234,10 @@ def _scan_entries(
                 entries_map[relpath] = (size, mtime, "F")
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
+        heartbeat += len(dir_entries)
+        if heartbeat >= 10_000:
+            log.info("Scan progress: %d entries scanned", len(entries_map))
+            heartbeat = 0
     return entries_map
 
 
@@ -295,74 +300,16 @@ def _snapshot(
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
     tmp = final.with_suffix(".tsv.gz.tmp")
     count = 0
-    _heartbeat_count = 0
     try:
-        with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            stack: collections.deque[Path] = collections.deque([mount])
-            while stack:
-                if cancel_evt.is_set():
-                    log.info("Snapshot cancelled for %s", mount)
-                    break
-                current = stack.pop()
-                try:
-                    with os.scandir(current) as it:
-                        entries = list(it)
-                except OSError:
-                    log.warning("Cannot scan %s", current)
-                    continue
-                dirs_to_push: list[Path] = []
-                for entry in entries:
-                    # Skip symlinks to avoid loops.
-                    if entry.is_symlink():
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                            mtime = datetime.fromtimestamp(
-                                mtime_ts, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            mtime = "-"
-                        line = f"{_escape_path(relpath)}\t-\t{mtime}\tL\n"
-                        gz.write(line.encode("utf-8", errors="replace"))
-                        count += 1
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name.upper() in _JUNK_DIRS_UPPER:
-                            continue
-                        dirs_to_push.append(Path(entry.path))
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            mtime_ts = entry.stat(follow_symlinks=False).st_mtime
-                            mtime = datetime.fromtimestamp(
-                                mtime_ts, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            mtime = "-"
-                        line = f"{_escape_path(relpath)}\t-\t{mtime}\tD\n"
-                    else:
-                        relpath = os.path.relpath(entry.path, mount)
-                        try:
-                            st = entry.stat(follow_symlinks=False)
-                            size = st.st_size
-                            mtime = datetime.fromtimestamp(
-                                st.st_mtime, tz=timezone.utc
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        except (OSError, ValueError, OverflowError):
-                            size = -1
-                            mtime = "-"
-                        line = f"{_escape_path(relpath)}\t{size}\t{mtime}\tF\n"
-                    gz.write(line.encode("utf-8", errors="replace"))
-                    count += 1
-                # Push subdirectories in reverse-sorted order.
-                dirs_to_push.sort(key=lambda p: p.name, reverse=True)
-                stack.extend(dirs_to_push)
-                _heartbeat_count += len(entries)
-                if _heartbeat_count >= 10_000:
-                    log.info("Snapshot progress: %d entries scanned", count)
-                    _heartbeat_count = 0
+        entries_map = _scan_entries(mount, cancel_evt)
         if cancel_evt.is_set():
             tmp.unlink(missing_ok=True)
             return
+        with gzip.open(tmp, "wb", compresslevel=1) as gz:
+            for relpath, (size, mtime, flag) in entries_map.items():
+                line = f"{_escape_path(relpath)}\t{size}\t{mtime}\t{flag}\n"
+                gz.write(line.encode("utf-8", errors="replace"))
+                count += 1
         os.replace(tmp, final)
         log.info("Snapshot written: %s (%d entries)", final, count)
     except Exception:
