@@ -543,7 +543,7 @@ if SYSTEM == "Windows":
         # Initialize COM.
         pythoncom.CoInitialize()
         try:
-            while True:
+            while not _shutdown.is_set():
                 try:
                     c = wmi.WMI()
                     # DriveType 2 == Removable
@@ -552,12 +552,14 @@ if SYSTEM == "Windows":
                         wmi_class="Win32_LogicalDisk",
                         DriveType=2,
                     )
-                    while True:
-                        disk = watcher()
-                        callback(disk)
+                    while not _shutdown.is_set():
+                        disk = watcher(timeout_ms=1000)
+                        if disk is not None:
+                            callback(disk)
                 except Exception:
-                    log.exception("WMI event error (%s)", notification_type)
-                    time.sleep(1)
+                    if not _shutdown.is_set():
+                        log.exception("WMI event error (%s)", notification_type)
+                        time.sleep(1)
         finally:
             pythoncom.CoUninitialize()
 
