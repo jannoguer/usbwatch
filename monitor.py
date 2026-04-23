@@ -571,17 +571,23 @@ if SYSTEM == "Windows":
 elif SYSTEM == "Linux":
     import time
 
-    def _find_mount(
-        device_node: str, retries: int = 12, interval: float = 0.5
-    ) -> str | None:
+    import re
+
+    def _decode_proc_mounts_field(field: str) -> str:
+        """Decode octal escape sequences in /proc/mounts fields (e.g. \\040 → space)."""
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+    def _find_mount(device_node: str, retries: int = 12, interval: float = 0.5) -> str | None:
         # Poll /proc/mounts until device appears.
+        # Fields are separated by single spaces; paths may contain \040-encoded spaces.
         for _ in range(retries):
             try:
                 with open("/proc/mounts") as f:
                     for line in f:
-                        parts = line.split()
+                        # Split on single space, max 3 splits to keep mount path intact.
+                        parts = line.split(" ", 3)
                         if len(parts) >= 2 and parts[0] == device_node:
-                            return parts[1]
+                            return _decode_proc_mounts_field(parts[1])
             except OSError:
                 pass
             time.sleep(interval)
