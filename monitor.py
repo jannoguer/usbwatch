@@ -394,6 +394,12 @@ def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None
         fh.close()
     except Exception:
         pass
+    # Remove the logger from the logging Manager to avoid a slow memory leak
+    # (Manager holds a permanent reference to every logger created by name).
+    try:
+        del logging.Logger.manager.loggerDict[ev_log.name]
+    except Exception:
+        pass
 
 
 def _start_watcher(mount: Path, label: str) -> tuple:
