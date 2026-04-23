@@ -516,7 +516,10 @@ if SYSTEM == "Windows":
                         DriveType=2,
                     )
                     while not _shutdown.is_set():
-                        disk = watcher(timeout_ms=1000)
+                        try:
+                            disk = watcher(timeout_ms=1000)
+                        except wmi.x_wmi_timed_out:
+                            continue
                         if disk is not None:
                             callback(disk)
                 except Exception:
