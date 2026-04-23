@@ -600,7 +600,7 @@ if SYSTEM == "Windows":
     def run() -> None:
         log.info("Starting USB monitor (Windows/WMI)")
         threading.Thread(
-            target=_scan_existing, name="scan-existing", daemon=True
+            target=_scan_existing, name="scan-existing", daemon=False
         ).start()
         t_add = threading.Thread(
             target=_wmi_thread,
@@ -686,7 +686,7 @@ elif SYSTEM == "Linux":
         mon.start()
         log.info("Starting USB monitor (Linux/pyudev)")
         threading.Thread(
-            target=_scan_existing, name="scan-existing", daemon=True
+            target=_scan_existing, name="scan-existing", daemon=False
         ).start()
         while not _shutdown.is_set():
             device = mon.poll(timeout=1.0)
