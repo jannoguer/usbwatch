@@ -109,11 +109,21 @@ def _safe(s: str) -> str:
 
 
 def _escape_path(p: str) -> str:
-    return p.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return (
+        p.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 def _unescape_path(p: str) -> str:
-    return p.replace("\\t", "\t").replace("\\r", "\r").replace("\\n", "\n").replace("\\\\", "\\")
+    return (
+        p.replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\n", "\n")
+        .replace("\\\\", "\\")
+    )
 
 
 # System directories to skip.
@@ -413,7 +423,7 @@ def on_connect(
     t_snap = threading.Thread(
         target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
     )
-    
+
     with _lock:
         if _is_shutting_down or drive_id in _active:
             return
@@ -577,7 +587,9 @@ elif SYSTEM == "Linux":
         """Decode octal escape sequences in /proc/mounts fields (e.g. \\040 → space)."""
         return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
-    def _find_mount(device_node: str, retries: int = 12, interval: float = 0.5) -> str | None:
+    def _find_mount(
+        device_node: str, retries: int = 12, interval: float = 0.5
+    ) -> str | None:
         # Poll /proc/mounts until device appears.
         # Fields are separated by single spaces; paths may contain \040-encoded spaces.
         for _ in range(retries):
