@@ -133,9 +133,11 @@ _JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 def _volume_serial(mount: Path) -> str | None:
     """Get stable volume identifier."""
     if platform.system() == "Windows":
+        # GetVolumeInformationW requires a root path ending with a backslash.
+        root = str(mount).rstrip("\\") + "\\"
         serial = ctypes.c_ulong(0)
         rc = ctypes.windll.kernel32.GetVolumeInformationW(
-            str(mount),
+            root,
             None,
             0,
             ctypes.byref(serial),
