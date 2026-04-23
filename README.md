@@ -101,10 +101,20 @@ python -c "import gzip, sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read
 
 **Atomic writes** - All output files are written to a `.tmp` sibling first and renamed into place with `os.replace`, so a crash or cancellation never leaves a partial or corrupt manifest on disk.
 
-## To Do
+## To do
 
 - [ ] Add an optional `--debug` flag to enable console output (in addition to log files).
 - [ ] Add an optional auto-sync feature to sync specific files or directories from the USB drive.
 - [ ] Add macOS support.
 - [ ] Implement file hashing (SHA-256) for more robust change detection.
 - [ ] Implement optional webhook notifications for drive connections and file events (must use encrypted connections).
+- [ ] Verify gzip integrity after write by reopening and decompressing the file before discarding the `.tmp`.
+- [ ] Persist a `latest_serial → manifest_path` JSON index to replace glob+sort lookup in `_load_manifest`.
+- [ ] Handle clock skew / mtime rollback by adding a monotonic tie-breaker to `_timestamp()` filenames.
+- [ ] Add a scan timeout / circuit-breaker to self-cancel `_scan_entries` after a configurable wall-clock limit.
+- [ ] Rate-limit `watchdog` event logging by batching/debouncing events before flushing to disk.
+- [ ] Detect and handle remount-without-removal instead of silently ignoring duplicate `Creation` events.
+- [ ] Separate the scan result from disk I/O so `_snapshot` and `_write_delta` become pure writers over a returned manifest.
+- [ ] Add structured JSON log output alongside the human-readable log for machine parsing.
+- [ ] Implement log/manifest retention policy to prune old snapshots and deltas from `logs/`.
+- [ ] Add a health-check heartbeat file (`logs/heartbeat`) with PID + timestamp for external supervisors.
