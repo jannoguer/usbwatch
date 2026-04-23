@@ -524,6 +524,8 @@ def on_disconnect(drive_id: str) -> None:
         log.exception("Error stopping observer for %s", drive_id)
     if "ev_log" in entry and "fh" in entry:
         _close_event_logger(entry["ev_log"], entry["fh"])
+    if "snapshot_thread" in entry:
+        entry["snapshot_thread"].join(timeout=10)
 
 
 SYSTEM = platform.system()
