@@ -243,7 +243,7 @@ def _scan_entries(
 
 def _write_atomic_gz(final: Path, lines_iter) -> int:
     """Write lines to a gzip file atomically using a temporary file."""
-    tmp = final.with_suffix(".tsv.gz.tmp")
+    tmp = final.parent / (final.name + ".tmp")
     count = 0
     try:
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
