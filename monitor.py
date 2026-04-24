@@ -190,12 +190,17 @@ def _fmt_time(ts: float) -> str:
         return "-"
 
 
+class ScanRootError(OSError):
+    """Raised when os.scandir fails on the mount root itself."""
+
+
 def _scan_entries(
     mount: Path, cancel_evt: threading.Event
 ) -> dict[str, tuple[int | str, str, str]]:
     """Return a path-to-metadata map of the directory tree."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
+    root_scan = True  # True only for the very first pop (mount root)
     heartbeat = 0
     while stack:
         if cancel_evt.is_set():
@@ -205,9 +210,15 @@ def _scan_entries(
         try:
             with os.scandir(current) as it:
                 dir_entries = list(it)
-        except OSError:
+        except OSError as exc:
+            if root_scan:
+                raise ScanRootError(
+                    f"Cannot scan mount root {mount}: {exc}"
+                ) from exc
             log.warning("Cannot scan %s", current)
             continue
+        finally:
+            root_scan = False
         dirs_to_push: list[Path] = []
         for entry in dir_entries:
             relpath = os.path.relpath(entry.path, mount)
@@ -265,7 +276,11 @@ def _write_delta(
     cancel_evt: threading.Event,
 ) -> None:
     """Write differential changes against old manifest."""
-    current_entries = _scan_entries(mount, cancel_evt)
+    try:
+        current_entries = _scan_entries(mount, cancel_evt)
+    except ScanRootError:
+        log.warning("Delta skipped: root scan failed for %s", mount)
+        return
     if cancel_evt.is_set():
         return
 
@@ -300,7 +315,11 @@ def _snapshot(
 ) -> None:
     """Write complete snapshot manifest."""
     cancel_evt = cancel_evt or threading.Event()
-    entries_map = _scan_entries(mount, cancel_evt)
+    try:
+        entries_map = _scan_entries(mount, cancel_evt)
+    except ScanRootError:
+        log.warning("Snapshot skipped: root scan failed for %s", mount)
+        return
     if cancel_evt.is_set():
         return
 
