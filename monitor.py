@@ -108,12 +108,15 @@ def _escape_path(p: str) -> str:
 
 
 def _unescape_path(p: str) -> str:
-    return (
-        p.replace("\\t", "\t")
-        .replace("\\r", "\r")
-        .replace("\\n", "\n")
-        .replace("\\\\", "\\")
-    )
+    import re
+    def repl(m):
+        c = m.group(1)
+        if c == "n": return "\n"
+        if c == "r": return "\r"
+        if c == "t": return "\t"
+        if c == "\\": return "\\"
+        return m.group(0)
+    return re.sub(r"\\(.)", repl, p)
 
 
 # System directories to skip.
