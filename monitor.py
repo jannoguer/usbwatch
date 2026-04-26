@@ -184,7 +184,7 @@ def _scan_entries(
     stack: collections.deque[Path] = collections.deque([mount])
     # Distinguishes the mount-root scandir failure (fatal) from sub-dir failures (skip).
     root_scan = True
-    heartbeat = 0
+    last_logged = 0
     while stack:
         if cancel_evt.is_set():
             log.info("Scan cancelled for %s", mount)
@@ -232,10 +232,9 @@ def _scan_entries(
                 entries_map[relpath] = (size, mtime, "F")
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
-        heartbeat += len(dir_entries)
-        if heartbeat >= 10_000:
+        if len(entries_map) - last_logged >= 10_000:
             log.info("Scan progress: %d entries scanned", len(entries_map))
-            heartbeat = 0
+            last_logged = len(entries_map)
     return entries_map
 
 
