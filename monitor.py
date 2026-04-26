@@ -486,7 +486,7 @@ elif SYSTEM == "Linux":
         # Limit the split to 3 so a mount path containing \040-encoded spaces stays intact.
         for _ in range(retries):
             try:
-                with open("/proc/mounts") as f:
+                with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         parts = line.split(" ", 3)
                         if len(parts) >= 2 and parts[0] == device_node:
