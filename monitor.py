@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import collections
 import ctypes
+import glob as _glob
 import gzip
 import logging
 import logging.handlers
@@ -137,27 +138,29 @@ def _volume_serial(mount: Path) -> str | None:
 
 
 def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
-    pattern = f"snapshot_*_{serial}_*.tsv.gz"
+    pattern = f"snapshot_*_{_glob.escape(serial)}_*.tsv.gz"
     candidates = sorted(LOGS_DIR.glob(pattern), key=lambda p: p.name, reverse=True)
     for cand in candidates:
-        manifest: dict[str, tuple[int | str, str, str]] = {}
         try:
             with gzip.open(cand, "rb") as gz:
-                for raw_line in gz:
-                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                    parts = line.split("\t")
-                    if len(parts) != 4:
-                        continue
-                    relpath, size_s, mtime, flag = parts
-                    size: int | str = (
-                        int(size_s)
-                        if size_s.lstrip("-").isdigit() and size_s != "-"
-                        else "-"
-                    )
-                    manifest[_unescape_path(relpath)] = (size, mtime, flag)
-            return manifest
+                data = gz.read()  # validates CRC; raises on truncation/corruption
         except Exception:
             log.exception("Failed to load manifest %s", cand)
+            continue
+        manifest: dict[str, tuple[int | str, str, str]] = {}
+        for raw_line in data.splitlines():
+            line = raw_line.decode("utf-8", errors="replace")
+            parts = line.split("\t")
+            if len(parts) != 4:
+                continue
+            relpath, size_s, mtime, flag = parts
+            size: int | str = (
+                int(size_s)
+                if size_s.lstrip("-").isdigit() and size_s != "-"
+                else "-"
+            )
+            manifest[_unescape_path(relpath)] = (size, mtime, flag)
+        return manifest
     return {}
 
 
