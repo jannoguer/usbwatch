@@ -116,12 +116,25 @@ _JUNK_DIRS: frozenset[str] = frozenset(
 _JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 
 
+if platform.system() == "Windows":
+    from ctypes import wintypes as _wt
+    _GVI = ctypes.windll.kernel32.GetVolumeInformationW
+    _GVI.argtypes = [
+        _wt.LPCWSTR, _wt.LPWSTR, _wt.DWORD,
+        ctypes.POINTER(_wt.DWORD),
+        ctypes.POINTER(_wt.DWORD),
+        ctypes.POINTER(_wt.DWORD),
+        _wt.LPWSTR, _wt.DWORD,
+    ]
+    _GVI.restype = _wt.BOOL
+
+
 def _volume_serial(mount: Path) -> str | None:
     if platform.system() == "Windows":
         # GetVolumeInformationW requires a root path ending with a backslash.
         root = str(mount).rstrip("\\") + "\\"
         serial = ctypes.c_ulong(0)
-        rc = ctypes.windll.kernel32.GetVolumeInformationW(
+        rc = _GVI(
             root,
             None,
             0,
