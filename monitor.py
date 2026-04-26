@@ -480,7 +480,7 @@ elif SYSTEM == "Linux":
         return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
     def _find_mount(
-        device_node: str, retries: int = 12, interval: float = 0.5
+        device_node: str, retries: int = 24, interval: float = 0.5
     ) -> str | None:
         # Poll /proc/mounts: udev fires before the kernel finishes mounting.
         # Limit the split to 3 so a mount path containing \040-encoded spaces stays intact.
@@ -528,7 +528,7 @@ elif SYSTEM == "Linux":
                 threading.Thread(
                     target=_handle_add,
                     args=(device,),
-                    name=f"handle-add-{device.sys_name}",
+                    name=f"handle-add-{_safe(device.sys_name)}",
                     daemon=True,
                 ).start()
 
@@ -553,7 +553,7 @@ elif SYSTEM == "Linux":
                 threading.Thread(
                     target=_handle_add,
                     args=(device,),
-                    name=f"handle-add-{device.sys_name}",
+                    name=f"handle-add-{_safe(device.sys_name)}",
                     daemon=True,
                 ).start()
             elif action == "remove":
