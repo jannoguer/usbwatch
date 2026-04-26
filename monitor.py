@@ -205,8 +205,12 @@ def _scan_entries(
         dirs_to_push: list[Path] = []
         for entry in dir_entries:
             relpath = os.path.relpath(entry.path, mount)
-            is_symlink = entry.is_symlink()
-            is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+            try:
+                is_symlink = entry.is_symlink()
+                is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+            except OSError:
+                log.warning("Cannot stat %s", entry.path)
+                continue
 
             if is_dir and entry.name.upper() in _JUNK_DIRS_UPPER:
                 continue
