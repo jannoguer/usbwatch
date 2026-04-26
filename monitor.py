@@ -375,7 +375,12 @@ def on_disconnect(drive_id: str) -> None:
     if "cancel_evt" in entry:
         entry["cancel_evt"].set()
     if "snapshot_thread" in entry:
-        entry["snapshot_thread"].join(timeout=10)
+        threading.Thread(
+            target=entry["snapshot_thread"].join,
+            args=(10,),
+            name=f"join-{drive_id}",
+            daemon=True,
+        ).start()
 
 
 SYSTEM = platform.system()
