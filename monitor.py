@@ -77,9 +77,9 @@ def _timestamp() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
 
 
-def _safe(s: str) -> str:
-    """Strip characters unsafe for filenames."""
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))
+def _safe(s: str, max_len: int = 64) -> str:
+    cleaned = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))
+    return cleaned[:max_len].lstrip("-_") or "unknown"
 
 
 def _escape_path(p: str) -> str:
