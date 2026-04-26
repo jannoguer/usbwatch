@@ -1,4 +1,3 @@
-watchdog>=3.0.0
 wmi>=1.5.1; sys_platform == "win32"
 pywin32>=305; sys_platform == "win32"
 pyudev>=0.24.0; sys_platform == "linux"

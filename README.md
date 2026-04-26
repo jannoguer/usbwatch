@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square)](https://github.com)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-Script that detects USB drives and logs their contents and file activity. Prepared to be run as a background service.
+Script that detects USB drives and logs their contents. Prepared to be run as a background service.
 
 </div>
 
@@ -39,7 +39,6 @@ For persistent background execution use Task Scheduler (Windows) or a systemd un
 
 - Drive arrival/removal detection (Windows) using WMI, `Win32_LogicalDisk` events via `pythoncom`
 - Drive arrival/removal detection (Linux) using `pyudev` netlink socket monitoring
-- File-system change events using `watchdog`, inotify (Linux), ReadDirectoryChangesW (Windows)
 - Full directory manifest on first connect using `os.scandir` iterative walk, gzip-compressed TSV
 - Differential delta on reconnect using manifest comparison keyed by volume serial / UUID
 - Volume identity across reconnects (Windows) using `GetVolumeInformationW` serial number
@@ -56,7 +55,6 @@ All files are written to `logs/` next to the script.
 | `monitor.log` | Script events, errors, and scan progress |
 | `snapshot_<label>_<serial>_<timestamp>.tsv.gz` | Full manifest on first connect (gzip-compressed TSV) |
 | `delta_<label>_<serial>_<timestamp>.tsv.gz` | Differential changes on reconnect (gzip-compressed TSV) |
-| `events_<label>_<timestamp>.log` | File create/delete/move/modify activity |
 
 ### Manifest format
 
@@ -84,7 +82,7 @@ To read compressed files:
 zcat logs/snapshot_*.tsv.gz | less
 
 # Python (any platform)
-python -c "import gzip, sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read())" logs/snapshot_*.tsv.gz
+python -c "import gzip,sys,glob;[sys.stdout.buffer.write(gzip.open(f).read())for a in sys.argv[1:]for f in glob.glob(a)]" logs/snapshot_*.tsv.gz
 ```
 
 ## How it works
@@ -94,8 +92,6 @@ python -c "import gzip, sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read
 **Snapshotting** - On first connect it walks the entire drive with `os.scandir` and writes a gzip-compressed TSV manifest. Each entry records relative path, size, mtime, and type (file / directory / symlink). Junk system directories (`$RECYCLE.BIN`, `System Volume Information`, etc.) are skipped.
 
 **Delta mode** - On subsequent reconnects of the same volume (identified by serial number or filesystem UUID), the previous manifest is loaded and compared against a fresh scan. Only additions (`+`), deletions (`-`), and modifications (`~`) are written, making reconnect scans significantly faster for large drives.
-
-**File-system monitoring** - Once the snapshot completes, `watchdog` attaches a live watcher that logs every create, delete, move, and modify event to a per-session events file. No polling, kernel notifications only.
 
 **Single-threaded scanning** - The scanner deliberately uses one thread per drive. USB mass-storage has a single command queue; parallel threads cause seek thrash on FAT/exFAT and NTFS-over-USB, degrading throughput on slow flash hardware.
 
@@ -107,12 +103,11 @@ python -c "import gzip, sys; sys.stdout.buffer.write(gzip.open(sys.argv[1]).read
 - [ ] Add an optional auto-sync feature to sync specific files or directories from the USB drive.
 - [ ] Add macOS support.
 - [ ] Implement file hashing (SHA-256) for more robust change detection.
-- [ ] Implement optional webhook notifications for drive connections and file events (must use encrypted connections).
+- [ ] Implement optional webhook notifications for drive connections (must use encrypted connections).
 - [ ] Verify gzip integrity after write by reopening and decompressing the file before discarding the `.tmp`.
 - [ ] Persist a `latest_serial → manifest_path` JSON index to replace glob+sort lookup in `_load_manifest`.
 - [ ] Handle clock skew / mtime rollback by adding a monotonic tie-breaker to `_timestamp()` filenames.
 - [ ] Add a scan timeout / circuit-breaker to self-cancel `_scan_entries` after a configurable wall-clock limit.
-- [ ] Rate-limit `watchdog` event logging by batching/debouncing events before flushing to disk.
 - [ ] Detect and handle remount-without-removal instead of silently ignoring duplicate `Creation` events.
 - [ ] Separate the scan result from disk I/O so `_snapshot` and `_write_delta` become pure writers over a returned manifest.
 - [ ] Add structured JSON log output alongside the human-readable log for machine parsing.

@@ -21,7 +21,6 @@ LOGS_DIR = SCRIPT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-# Set up file logging before redirecting stdout/stderr.
 _root_handler = logging.handlers.RotatingFileHandler(
     str(LOGS_DIR / "monitor.log"),
     maxBytes=5 * 1024 * 1024,
@@ -33,35 +32,31 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-# Silence console output; keep a real fallback for the logging lastResort handler.
 _devnull_fd = os.open(os.devnull, os.O_WRONLY)
 _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
 sys.stdout = _devnull_out
-# Do NOT redirect stderr — the logging lastResort handler writes there, and
-# silencing it would swallow any errors that occur before the log file opens.
+# stderr is left alone: logging's lastResort handler writes there as a
+# fallback before our log file opens.
 atexit.register(lambda: os.close(_devnull_fd))
 atexit.register(_devnull_out.close)
 
-# Global shutdown event — set by signal handlers to trigger clean exit.
 _shutdown = threading.Event()
 _is_shutting_down = False
 
 
 def _handle_signal(signum, frame) -> None:  # noqa: ARG001
-    """Signal handler: request graceful shutdown."""
     _shutdown.set()
 
 
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# drive_id -> {"observer": Observer, "ev_log": Logger, "fh": FileHandler}
+# drive_id -> {"cancel_evt": Event, "snapshot_thread": Thread, "serial": str}
 _active: dict = {}
 _lock = threading.Lock()
 
 
 def _teardown_all() -> None:
-    """Stop all active observers and close event loggers on shutdown."""
     global _is_shutting_down
     with _lock:
         _is_shutting_down = True
@@ -72,19 +67,7 @@ def _teardown_all() -> None:
             continue
         if "cancel_evt" in entry:
             entry["cancel_evt"].set()
-        if entry.get("status") == "connecting":
-            if "snapshot_thread" in entry:
-                entry["snapshot_thread"].join(timeout=10)
-            continue
-        log.info("Shutdown: stopping observer for %s", drive_id)
-        try:
-            if entry.get("observer"):
-                entry["observer"].stop()
-                entry["observer"].join(timeout=5)
-        except Exception:
-            log.exception("Error stopping observer for %s on shutdown", drive_id)
-        if "ev_log" in entry and "fh" in entry:
-            _close_event_logger(entry["ev_log"], entry["fh"])
+        log.info("Shutdown: cancelling snapshot for %s", drive_id)
         if "snapshot_thread" in entry:
             entry["snapshot_thread"].join(timeout=10)
 
@@ -119,7 +102,6 @@ def _unescape_path(p: str) -> str:
     return re.sub(r"\\(.)", repl, p)
 
 
-# System directories to skip.
 _JUNK_DIRS: frozenset[str] = frozenset(
     {
         "System Volume Information",
@@ -134,7 +116,6 @@ _JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 
 
 def _volume_serial(mount: Path) -> str | None:
-    """Get stable volume identifier."""
     if platform.system() == "Windows":
         # GetVolumeInformationW requires a root path ending with a backslash.
         root = str(mount).rstrip("\\") + "\\"
@@ -156,7 +137,6 @@ def _volume_serial(mount: Path) -> str | None:
 
 
 def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
-    """Load latest snapshot manifest."""
     pattern = f"snapshot_*_{serial}_*.tsv.gz"
     candidates = sorted(LOGS_DIR.glob(pattern), key=lambda p: p.name, reverse=True)
     for cand in candidates:
@@ -197,10 +177,10 @@ class ScanRootError(OSError):
 def _scan_entries(
     mount: Path, cancel_evt: threading.Event
 ) -> dict[str, tuple[int | str, str, str]]:
-    """Return a path-to-metadata map of the directory tree."""
     entries_map: dict[str, tuple[int | str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
-    root_scan = True  # True only for the very first pop (mount root)
+    # Distinguishes the mount-root scandir failure (fatal) from sub-dir failures (skip).
+    root_scan = True
     heartbeat = 0
     while stack:
         if cancel_evt.is_set():
@@ -253,7 +233,7 @@ def _scan_entries(
 
 
 def _write_atomic_gz(final: Path, lines_iter) -> int:
-    """Write lines to a gzip file atomically using a temporary file."""
+    """Write lines to a gzip file atomically via a .tmp sibling + os.replace."""
     tmp = final.parent / (final.name + ".tmp")
     count = 0
     try:
@@ -275,7 +255,6 @@ def _write_delta(
     old_manifest: dict[str, tuple[int | str, str, str]],
     cancel_evt: threading.Event,
 ) -> None:
-    """Write differential changes against old manifest."""
     try:
         current_entries = _scan_entries(mount, cancel_evt)
     except ScanRootError:
@@ -313,7 +292,6 @@ def _snapshot(
     serial: str | None = None,
     cancel_evt: threading.Event | None = None,
 ) -> None:
-    """Write complete snapshot manifest."""
     cancel_evt = cancel_evt or threading.Event()
     try:
         entries_map = _scan_entries(mount, cancel_evt)
@@ -338,80 +316,9 @@ def _snapshot(
         log.exception("Snapshot failed for %s", mount)
 
 
-def _make_event_logger(label: str) -> tuple:
-    ts = _timestamp()
-    path = LOGS_DIR / f"events_{_safe(label)}_{ts}.log"
-    lg = logging.getLogger(f"usb.{_safe(label)}.{ts}")
-    lg.setLevel(logging.INFO)
-    lg.propagate = False
-    fh = logging.FileHandler(str(path), encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    lg.addHandler(fh)
-    return lg, fh
-
-
-def _close_event_logger(ev_log: logging.Logger, fh: logging.FileHandler) -> None:
-    try:
-        ev_log.removeHandler(fh)
-    except Exception:
-        pass
-    try:
-        fh.close()
-    except Exception:
-        pass
-    # Remove the logger from the logging Manager to avoid a slow memory leak
-    # (Manager holds a permanent reference to every logger created by name).
-    try:
-        del logging.Logger.manager.loggerDict[ev_log.name]
-    except Exception:
-        pass
-
-
-def _start_watcher(mount: Path, label: str) -> tuple:
-    from watchdog.events import FileSystemEventHandler
-    from watchdog.observers import Observer
-
-    ev_log, fh = _make_event_logger(label)
-
-    class _Handler(FileSystemEventHandler):
-        def on_created(self, e):
-            ev_log.info(
-                "CREATED  %s  %s", "DIR" if e.is_directory else "FILE", e.src_path
-            )
-
-        def on_deleted(self, e):
-            ev_log.info(
-                "DELETED  %s  %s", "DIR" if e.is_directory else "FILE", e.src_path
-            )
-
-        def on_modified(self, e):
-            ev_log.info(
-                "MODIFIED %s  %s", "DIR" if e.is_directory else "FILE", e.src_path
-            )
-
-        def on_moved(self, e):
-            ev_log.info(
-                "MOVED    %s  %s -> %s",
-                "DIR" if e.is_directory else "FILE",
-                e.src_path,
-                e.dest_path,
-            )
-
-    obs = Observer()
-    try:
-        obs.schedule(_Handler(), str(mount), recursive=True)
-        obs.start()
-        log.info("FS monitor started: %s", mount)
-    except OSError:
-        log.warning("Failed to start FS monitor for %s", mount)
-        return None, ev_log, fh
-    return obs, ev_log, fh
-
-
 def _do_snapshot(
     mount: Path, label: str, serial: str | None, cancel_evt: threading.Event
 ) -> None:
-    """Execute snapshot or delta."""
     if serial:
         old = _load_manifest(serial)
         if old:
@@ -437,9 +344,12 @@ def on_connect(
             return
         _active[drive_id] = {
             "cancel_evt": cancel_evt,
-            "status": "connecting",
             "snapshot_thread": t_snap,
+            "serial": serial,
         }
+        # Start under the lock so every entry in _active has a started thread;
+        # otherwise on_disconnect / _teardown_all could join() before start().
+        t_snap.start()
 
     log.info(
         "USB connected: id=%s mount=%s label=%s serial=%s",
@@ -448,31 +358,6 @@ def on_connect(
         label,
         serial or "unknown",
     )
-    t_snap.start()
-    obs, ev_log, fh = _start_watcher(mount, label)
-
-    with _lock:
-        entry = _active.get(drive_id)
-        if entry is None or entry.get("cancel_evt") is not cancel_evt:
-            # Teardown observer if drive disconnected during setup.
-            log.warning(
-                "Drive %s disconnected during setup; tearing down observer", drive_id
-            )
-            cancel_evt.set()
-            if obs:
-                obs.stop()
-                obs.join(timeout=5)
-            _close_event_logger(ev_log, fh)
-            return
-        _active[drive_id] = {
-            "observer": obs,
-            "ev_log": ev_log,
-            "fh": fh,
-            "serial": serial,
-            "cancel_evt": cancel_evt,
-            "status": "connected",
-            "snapshot_thread": t_snap,
-        }
 
 
 def on_disconnect(drive_id: str) -> None:
@@ -483,20 +368,6 @@ def on_disconnect(drive_id: str) -> None:
     log.info("USB disconnected: id=%s", drive_id)
     if "cancel_evt" in entry:
         entry["cancel_evt"].set()
-    if entry.get("status") == "connecting":
-        log.warning(
-            "Disconnect during connect setup for %s; watcher may not have started",
-            drive_id,
-        )
-        return
-    try:
-        if entry.get("observer"):
-            entry["observer"].stop()
-            entry["observer"].join(timeout=5)
-    except Exception:
-        log.exception("Error stopping observer for %s", drive_id)
-    if "ev_log" in entry and "fh" in entry:
-        _close_event_logger(entry["ev_log"], entry["fh"])
     if "snapshot_thread" in entry:
         entry["snapshot_thread"].join(timeout=10)
 
@@ -511,13 +382,12 @@ if SYSTEM == "Windows":
         import pythoncom
         import wmi
 
-        # Initialize COM.
         pythoncom.CoInitialize()
         try:
             while not _shutdown.is_set():
                 try:
                     c = wmi.WMI()
-                    # DriveType 2 == Removable
+                    # DriveType=2 → removable.
                     watcher = c.watch_for(
                         notification_type=notification_type,
                         wmi_class="Win32_LogicalDisk",
@@ -601,13 +471,12 @@ elif SYSTEM == "Linux":
     def _find_mount(
         device_node: str, retries: int = 12, interval: float = 0.5
     ) -> str | None:
-        # Poll /proc/mounts until device appears.
-        # Fields are separated by single spaces; paths may contain \040-encoded spaces.
+        # Poll /proc/mounts: udev fires before the kernel finishes mounting.
+        # Limit the split to 3 so a mount path containing \040-encoded spaces stays intact.
         for _ in range(retries):
             try:
                 with open("/proc/mounts") as f:
                     for line in f:
-                        # Split on single space, max 3 splits to keep mount path intact.
                         parts = line.split(" ", 3)
                         if len(parts) >= 2 and parts[0] == device_node:
                             return _decode_proc_mounts_field(parts[1])
@@ -617,7 +486,7 @@ elif SYSTEM == "Linux":
         return None
 
     def _is_usb(device) -> bool:
-        # Check for USB bus membership.
+        # Walk parents — ID_BUS is set on the USB device, not the partition.
         d = device
         while d is not None:
             if d.get("ID_BUS") == "usb":
@@ -632,7 +501,6 @@ elif SYSTEM == "Linux":
         if not node:
             return
         label = device.get("ID_FS_LABEL") or device.get("ID_SERIAL") or device.sys_name
-        # Use filesystem UUID as stable volume serial.
         serial = device.get("ID_FS_UUID")
         mount = _find_mount(node)
         if mount:
