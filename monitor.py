@@ -750,6 +750,9 @@ def materialize_snapshot(snapshot_path: Path) -> None:
 
     delta_ids = []
     for delta_path, _ in deltas:
+        if _shutdown.is_set():
+            print("Materialize interrupted")
+            sys.exit(1)
         print(f"  Applying: {delta_path.name}")
         manifest = _apply_delta(manifest, delta_path)
         with _cache_lock:
