@@ -454,16 +454,11 @@ def _write_delta(
                 yield f"+\t{enc_relpath}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
             else:
                 old_size, old_mtime, old_hash, old_flag = old_manifest[relpath]
-                hash_changed = (
-                    file_hash != old_hash
-                    and old_hash != "-"
-                    and file_hash != "-"
-                )
                 if (
                     size != old_size
                     or mtime != old_mtime
                     or flag != old_flag
-                    or hash_changed
+                    or file_hash != old_hash
                 ):
                     yield f"~\t{enc_relpath}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
         for relpath in old_manifest:
