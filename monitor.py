@@ -121,13 +121,13 @@ def _teardown_all() -> None:
 
 
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
 
 
 def _timestamp_to_iso(ts: str) -> str:
-    """Convert _timestamp() format to ISO 8601 with local timezone."""
-    dt = datetime.strptime(ts, "%Y%m%d_%H%M%S_%f")
-    return dt.astimezone().isoformat()
+    """Convert _timestamp() format to ISO 8601 UTC."""
+    dt = datetime.strptime(ts, "%Y%m%d_%H%M%S_%f").replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 def _safe(s: str, max_len: int = 64) -> str:
