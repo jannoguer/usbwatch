@@ -220,13 +220,14 @@ def _hash_file(
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
-            while True:
-                if cancel_evt.is_set():
-                    return "-"
+            while not cancel_evt.is_set():
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
                 h.update(chunk)
+
+            if cancel_evt.is_set():
+                return "-"
     except OSError:
         return "-"
     return h.hexdigest()
