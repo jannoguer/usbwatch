@@ -430,9 +430,16 @@ if SYSTEM == "Windows":
             pythoncom.CoUninitialize()
 
     def _on_arrival(disk) -> None:
+        # GetVolumeInformationW inside on_connect can block on a slow drive;
+        # run it off the WMI watcher thread so subsequent events aren't lost.
         drive_id = disk.DeviceID  # e.g. "E:"
         label = disk.VolumeName or drive_id.rstrip(":")
-        on_connect(drive_id, Path(drive_id + "\\"), label)
+        threading.Thread(
+            target=on_connect,
+            args=(drive_id, Path(drive_id + "\\"), label),
+            name=f"on-connect-{_safe(drive_id)}",
+            daemon=True,
+        ).start()
 
     def _on_removal(disk) -> None:
         on_disconnect(disk.DeviceID)
