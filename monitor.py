@@ -507,17 +507,16 @@ def _snapshot(
 
 
 def _do_snapshot(
-    mount: Path, label: str, serial: str | None, cancel_evt: threading.Event
+    mount: Path, label: str, serial: str | None, cancel_evt: threading.Event, drive_id: str
 ) -> None:
     snapshot_id = _snapshot(mount, label, serial, cancel_evt)
     if not snapshot_id:
         return
 
     with _lock:
-        for drive_id, entry in list(_active.items()):
-            if isinstance(entry, dict) and entry.get("serial") == serial:
-                entry["baseline_id"] = snapshot_id
-                break
+        entry = _active.get(drive_id)
+        if entry and isinstance(entry, dict):
+            entry["baseline_id"] = snapshot_id
 
 
 def _find_baseline_id(serial: str) -> str | None:
@@ -561,11 +560,11 @@ def on_connect(
         else:
             log.warning("Baseline ID found but manifest load failed; creating new snapshot")
             t_snap = threading.Thread(
-                target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
+                target=_do_snapshot, args=(mount, label, serial, cancel_evt, drive_id), daemon=True
             )
     else:
         t_snap = threading.Thread(
-            target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
+            target=_do_snapshot, args=(mount, label, serial, cancel_evt, drive_id), daemon=True
         )
 
     with _lock:
