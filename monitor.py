@@ -466,9 +466,8 @@ if SYSTEM == "Windows":
 
     def run() -> None:
         log.info("Starting USB monitor (Windows/WMI)")
-        threading.Thread(
-            target=_scan_existing, name="scan-existing", daemon=True
-        ).start()
+        # Start watchers before scanning existing drives so a drive arriving
+        # during enumeration is still caught by the Creation watcher.
         t_add = threading.Thread(
             target=_wmi_thread,
             args=("Creation", _on_arrival),
@@ -483,6 +482,9 @@ if SYSTEM == "Windows":
         )
         t_add.start()
         t_rem.start()
+        threading.Thread(
+            target=_scan_existing, name="scan-existing", daemon=True
+        ).start()
         while not _shutdown.wait(timeout=1.0):
             pass
         _teardown_all()
