@@ -333,52 +333,55 @@ def _scan_entries(
             log.info("Scan cancelled for %s", mount)
             return {}
         current = stack.pop()
+        dirs_to_push: list[Path] = []
         try:
             with os.scandir(current) as it:
-                dir_entries = list(it)
+                # Per-entry stat/hash stays inside the with block: on POSIX
+                # entry.stat() always syscalls (fine), but on Windows the
+                # cached attrs from the initial scan are only guaranteed
+                # while the iterator is alive.
+                for entry in it:
+                    relpath = os.path.relpath(entry.path, mount)
+                    try:
+                        is_symlink = entry.is_symlink()
+                        is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        log.warning("Cannot stat %s", entry.path)
+                        continue
+
+                    if is_dir and entry.name.upper() in _JUNK_DIRS_UPPER:
+                        continue
+
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        mtime = _fmt_time(st.st_mtime)
+                    except OSError:
+                        st = None
+                        mtime = "-"
+
+                    if is_symlink:
+                        entries_map[relpath] = ("-", mtime, "-", "L")
+                    elif is_dir:
+                        dirs_to_push.append(Path(entry.path))
+                        entries_map[relpath] = ("-", mtime, "-", "D")
+                    else:
+                        size = st.st_size if st else -1
+                        if st:
+                            try:
+                                file_hash = _hash_file(entry.path, cancel_evt)
+                            except ScanCancelled:
+                                log.info("Scan cancelled for %s", mount)
+                                return {}
+                        else:
+                            file_hash = "-"
+                        entries_map[relpath] = (size, mtime, file_hash, "F")
         except OSError as exc:
             if root_scan:
                 raise ScanRootError(f"Cannot scan mount root {mount}: {exc}") from exc
             log.warning("Cannot scan %s", current)
-            continue
-        finally:
             root_scan = False
-        dirs_to_push: list[Path] = []
-        for entry in dir_entries:
-            relpath = os.path.relpath(entry.path, mount)
-            try:
-                is_symlink = entry.is_symlink()
-                is_dir = not is_symlink and entry.is_dir(follow_symlinks=False)
-            except OSError:
-                log.warning("Cannot stat %s", entry.path)
-                continue
-
-            if is_dir and entry.name.upper() in _JUNK_DIRS_UPPER:
-                continue
-
-            try:
-                st = entry.stat(follow_symlinks=False)
-                mtime = _fmt_time(st.st_mtime)
-            except OSError:
-                st = None
-                mtime = "-"
-
-            if is_symlink:
-                entries_map[relpath] = ("-", mtime, "-", "L")
-            elif is_dir:
-                dirs_to_push.append(Path(entry.path))
-                entries_map[relpath] = ("-", mtime, "-", "D")
-            else:
-                size = st.st_size if st else -1
-                if st:
-                    try:
-                        file_hash = _hash_file(entry.path, cancel_evt)
-                    except ScanCancelled:
-                        log.info("Scan cancelled for %s", mount)
-                        return {}
-                else:
-                    file_hash = "-"
-                entries_map[relpath] = (size, mtime, file_hash, "F")
+            continue
+        root_scan = False
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
         if len(entries_map) - last_logged >= 10_000:
