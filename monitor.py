@@ -720,6 +720,9 @@ def _apply_delta(
 
 def materialize_snapshot(snapshot_path: Path) -> None:
     """Reconstruct a snapshot by applying all deltas that reference it."""
+    # Materialize runs without run()'s startup, so the manifest cache that
+    # _find_deltas_for_baseline relies on is otherwise empty.
+    _load_all_manifests()
     print(f"Reading baseline snapshot: {snapshot_path}")
     header, manifest = _read_manifest_with_header(snapshot_path)
 
