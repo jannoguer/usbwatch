@@ -79,9 +79,7 @@ if _args.command != "materialize":
         )
         logging.getLogger().addHandler(_console_handler)
     else:
-        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        _devnull_out = os.fdopen(_devnull_fd, "w")
-        sys.stdout = _devnull_out
+        sys.stdout = open(os.devnull, "w")
         # stderr is left alone: logging's lastResort handler writes there as a
         # fallback before our log file opens.
 
