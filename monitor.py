@@ -223,21 +223,24 @@ def _volume_serial(mount: Path) -> str | None:
     return None
 
 
+class ScanCancelled(Exception):
+    """Raised when a scan is cancelled mid-operation."""
+
+
 def _hash_file(
     path: str, cancel_evt: threading.Event, chunk_size: int = 1024 * 1024
 ) -> str:
-    """SHA-256 of a file's contents; "-" on read error or cancellation."""
+    """SHA-256 of a file's contents; "-" on read error. Raises ScanCancelled on cancel."""
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
-            while not cancel_evt.is_set():
+            while True:
+                if cancel_evt.is_set():
+                    raise ScanCancelled
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
                 h.update(chunk)
-
-            if cancel_evt.is_set():
-                return "-"
     except OSError:
         return "-"
     return h.hexdigest()
@@ -369,7 +372,14 @@ def _scan_entries(
                 entries_map[relpath] = ("-", mtime, "-", "D")
             else:
                 size = st.st_size if st else -1
-                file_hash = _hash_file(entry.path, cancel_evt) if st else "-"
+                if st:
+                    try:
+                        file_hash = _hash_file(entry.path, cancel_evt)
+                    except ScanCancelled:
+                        log.info("Scan cancelled for %s", mount)
+                        return {}
+                else:
+                    file_hash = "-"
                 entries_map[relpath] = (size, mtime, file_hash, "F")
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
