@@ -161,11 +161,15 @@ def _unescape_path(p: str) -> str:
 
 
 def _validate_relpath(p: str) -> bool:
-    """Ensure path is relative and doesn't escape via .."""
-    if os.path.isabs(p):
+    """Ensure path is relative, has no drive component, and doesn't escape via .."""
+    if not p or os.path.isabs(p):
+        return False
+    if os.path.splitdrive(p)[0]:
         return False
     norm = os.path.normpath(p)
-    return not (norm.startswith('..') or norm == '..')
+    if norm in (".", ".."):
+        return False
+    return not norm.startswith("..")
 
 
 _JUNK_DIRS: frozenset[str] = frozenset(
