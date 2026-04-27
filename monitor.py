@@ -79,12 +79,10 @@ if _args.command != "materialize":
         logging.getLogger().addHandler(_console_handler)
     else:
         _devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
+        _devnull_out = os.fdopen(_devnull_fd, "w")
         sys.stdout = _devnull_out
         # stderr is left alone: logging's lastResort handler writes there as a
         # fallback before our log file opens.
-        atexit.register(lambda: os.close(_devnull_fd))
-        atexit.register(_devnull_out.close)
 
 _shutdown = threading.Event()
 _is_shutting_down = False
@@ -160,6 +158,14 @@ def _unescape_path(p: str) -> str:
         return m.group(0)
 
     return re.sub(r"\\(.)", repl, p)
+
+
+def _validate_relpath(p: str) -> bool:
+    """Ensure path is relative and doesn't escape via .."""
+    if os.path.isabs(p):
+        return False
+    norm = os.path.normpath(p)
+    return not (norm.startswith('..') or norm == '..')
 
 
 _JUNK_DIRS: frozenset[str] = frozenset(
@@ -286,10 +292,13 @@ def _load_manifest(baseline_id: str) -> dict[str, tuple[int | str, str, str, str
             file_hash = "-"
         else:
             continue
+        relpath = _unescape_path(relpath)
+        if not _validate_relpath(relpath):
+            continue
         size: int | str = (
             int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
         )
-        manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
+        manifest[relpath] = (size, mtime, file_hash, flag)
     return manifest
 
 
@@ -298,7 +307,8 @@ def _fmt_time(ts: float) -> str:
         return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-    except (OSError, ValueError, OverflowError):
+    except (OSError, ValueError, OverflowError) as e:
+        log.debug("Invalid timestamp %s: %s", ts, e)
         return "-"
 
 
@@ -637,10 +647,13 @@ def _read_manifest_with_header(path: Path) -> tuple[dict, dict[str, tuple[int | 
             file_hash = "-"
         else:
             continue
+        relpath = _unescape_path(relpath)
+        if not _validate_relpath(relpath):
+            continue
         size: int | str = (
             int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
         )
-        manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
+        manifest[relpath] = (size, mtime, file_hash, flag)
 
     return header, manifest
 
@@ -685,6 +698,8 @@ def _apply_delta(
 
         change = parts[0]
         relpath = _unescape_path(parts[1])
+        if not _validate_relpath(relpath):
+            continue
 
         if change == "+":
             size_s, mtime, file_hash, flag = parts[2], parts[3], parts[4], parts[5]
@@ -728,14 +743,11 @@ def materialize_snapshot(snapshot_path: Path) -> None:
     for delta_path, _ in deltas:
         print(f"  Applying: {delta_path.name}")
         manifest = _apply_delta(manifest, delta_path)
-        try:
-            with gzip.open(delta_path, "rb") as gz:
-                first_line = gz.readline().decode("utf-8", errors="replace")
-                if first_line.startswith("#"):
-                    delta_header = json.loads(first_line[1:])
-                    delta_ids.append(delta_header.get("id"))
-        except (json.JSONDecodeError, OSError):
-            pass
+        with _cache_lock:
+            for _mid, (cached_path, cached_header) in _manifest_cache.items():
+                if cached_path == delta_path:
+                    delta_ids.append(cached_header.get("id"))
+                    break
 
     print(f"Materialized entries: {len(manifest)}")
 
