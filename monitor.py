@@ -144,7 +144,7 @@ def _volume_serial(mount: Path) -> str | None:
             None,
             0,
         )
-        if rc:
+        if rc and serial.value:
             return format(serial.value, "08x")
         log.warning("GetVolumeInformationW failed for %s (rc=%s)", mount, rc)
     return None
@@ -401,8 +401,6 @@ SYSTEM = platform.system()
 if SYSTEM == "Windows":
 
     def _wmi_thread(notification_type: str, callback) -> None:
-        import time
-
         import pythoncom
         import wmi
 
@@ -427,7 +425,7 @@ if SYSTEM == "Windows":
                 except Exception:
                     if not _shutdown.is_set():
                         log.exception("WMI event error (%s)", notification_type)
-                        time.sleep(1)
+                        _shutdown.wait(1)
         finally:
             pythoncom.CoUninitialize()
 
@@ -462,7 +460,7 @@ if SYSTEM == "Windows":
     def run() -> None:
         log.info("Starting USB monitor (Windows/WMI)")
         threading.Thread(
-            target=_scan_existing, name="scan-existing", daemon=False
+            target=_scan_existing, name="scan-existing", daemon=True
         ).start()
         t_add = threading.Thread(
             target=_wmi_thread,
@@ -484,8 +482,6 @@ if SYSTEM == "Windows":
         log.info("USB monitor stopped")
 
 elif SYSTEM == "Linux":
-    import time
-
     import re
 
     def _decode_proc_mounts_field(field: str) -> str:
@@ -506,7 +502,8 @@ elif SYSTEM == "Linux":
                             return _decode_proc_mounts_field(parts[1])
             except OSError:
                 pass
-            time.sleep(interval)
+            if _shutdown.wait(interval):
+                return None
         return None
 
     def _is_usb(device) -> bool:
@@ -554,7 +551,7 @@ elif SYSTEM == "Linux":
         mon.start()
         log.info("Starting USB monitor (Linux/pyudev)")
         threading.Thread(
-            target=_scan_existing, name="scan-existing", daemon=False
+            target=_scan_existing, name="scan-existing", daemon=True
         ).start()
         while not _shutdown.is_set():
             device = mon.poll(timeout=1.0)
