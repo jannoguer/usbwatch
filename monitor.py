@@ -6,9 +6,9 @@ import argparse
 import atexit
 import collections
 import ctypes
-import glob as _glob
 import gzip
 import hashlib
+import json
 import logging
 import logging.handlers
 import os
@@ -16,6 +16,7 @@ import platform
 import signal
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,7 +70,6 @@ def _handle_signal(signum, frame) -> None:  # noqa: ARG001
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# drive_id -> {"cancel_evt": Event, "snapshot_thread": Thread, "serial": str}
 _active: dict = {}
 _lock = threading.Lock()
 
@@ -91,7 +91,13 @@ def _teardown_all() -> None:
 
 
 def _timestamp() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _timestamp_to_iso(ts: str) -> str:
+    """Convert _timestamp() format to ISO 8601 with local timezone."""
+    dt = datetime.strptime(ts, "%Y%m%d_%H%M%S_%f")
+    return dt.astimezone().isoformat()
 
 
 def _safe(s: str, max_len: int = 64) -> str:
@@ -196,24 +202,38 @@ def _hash_file(
     return h.hexdigest()
 
 
-def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str, str]]:
-    pattern = f"snapshot_*_{_glob.escape(serial)}_*.tsv.gz"
-    candidates = sorted(LOGS_DIR.glob(pattern), key=lambda p: p.name, reverse=True)
-    for cand in candidates:
+def _load_manifest(baseline_id: str) -> dict[str, tuple[int | str, str, str, str]]:
+    """Load a snapshot manifest by its ID from the logs directory."""
+    for cand in LOGS_DIR.glob("snapshot_*.tsv.gz"):
         try:
             with gzip.open(cand, "rb") as gz:
-                data = gz.read()  # validates CRC; raises on truncation/corruption
+                data = gz.read()
         except Exception:
             log.exception("Failed to load manifest %s", cand)
             continue
+
+        lines = data.splitlines()
+        if not lines:
+            continue
+
+        first_line = lines[0].decode("utf-8", errors="replace")
+        if not first_line.startswith("#"):
+            continue
+
+        try:
+            header = json.loads(first_line[1:])
+            if header.get("id") != baseline_id or header.get("type") != "snapshot":
+                continue
+        except (json.JSONDecodeError, KeyError):
+            continue
+
         manifest: dict[str, tuple[int | str, str, str, str]] = {}
-        for raw_line in data.splitlines():
+        for raw_line in lines[1:]:
             line = raw_line.decode("utf-8", errors="replace")
             parts = line.split("\t")
             if len(parts) == 5:
                 relpath, size_s, mtime, file_hash, flag = parts
             elif len(parts) == 4:
-                # Legacy 4-column manifest: no hash column.
                 relpath, size_s, mtime, flag = parts
                 file_hash = "-"
             else:
@@ -244,7 +264,6 @@ def _scan_entries(
 ) -> dict[str, tuple[int | str, str, str, str]]:
     entries_map: dict[str, tuple[int | str, str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
-    # Distinguishes the mount-root scandir failure (fatal) from sub-dir failures (skip).
     root_scan = True
     last_logged = 0
     while stack:
@@ -299,13 +318,28 @@ def _scan_entries(
     return entries_map
 
 
-def _write_atomic_gz(final: Path, lines_iter) -> int:
+def _compute_entries_sha256(lines_iter) -> tuple[list[str], str]:
+    """Compute SHA-256 of TSV lines and return (lines, hex_digest)."""
+    h = hashlib.sha256()
+    lines = []
+    for line in lines_iter:
+        lines.append(line)
+        h.update(line.encode("utf-8", errors="replace"))
+    return lines, h.hexdigest()
+
+
+def _write_atomic_gz(final: Path, header: dict, lines_iter) -> int:
     """Write lines to a gzip file atomically via a .tmp sibling + os.replace."""
     tmp = final.parent / (final.name + ".tmp")
     count = 0
     try:
+        lines, entries_sha256 = _compute_entries_sha256(lines_iter)
+        header["entries_count"] = len(lines)
+        header["entries_sha256"] = entries_sha256
+
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
-            for line in lines_iter:
+            gz.write(f"#{json.dumps(header, separators=(',', ':'))}\n".encode("utf-8"))
+            for line in lines:
                 gz.write(line.encode("utf-8", errors="replace"))
                 count += 1
         os.replace(tmp, final)
@@ -319,6 +353,7 @@ def _write_delta(
     mount: Path,
     label: str,
     serial: str,
+    baseline_id: str,
     old_manifest: dict[str, tuple[int | str, str, str, str]],
     cancel_evt: threading.Event,
 ) -> None:
@@ -333,6 +368,18 @@ def _write_delta(
     ts = _timestamp()
     final = LOGS_DIR / f"delta_{_safe(label)}_{serial}_{ts}.tsv.gz"
 
+    header = {
+        "id": str(uuid.uuid4()),
+        "type": "delta",
+        "created_at": _timestamp_to_iso(ts),
+        "baseline_id": baseline_id,
+        "drive": {
+            "serial": serial,
+            "label": label,
+            "mount": str(mount),
+        },
+    }
+
     def _lines():
         for relpath, (size, mtime, file_hash, flag) in current_entries.items():
             enc_relpath = _escape_path(relpath)
@@ -340,8 +387,6 @@ def _write_delta(
                 yield f"+\t{enc_relpath}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
             else:
                 old_size, old_mtime, old_hash, old_flag = old_manifest[relpath]
-                # Hash diff only counts when both sides recorded one;
-                # legacy 4-col manifests carry "-" and must not force "~" alone.
                 hash_changed = (
                     file_hash != old_hash
                     and old_hash != "-"
@@ -359,7 +404,7 @@ def _write_delta(
                 yield f"-\t{_escape_path(relpath)}\t-\t-\t-\t-\n"
 
     try:
-        count = _write_atomic_gz(final, _lines())
+        count = _write_atomic_gz(final, header, _lines())
         log.info("Delta written: %s (%d changes)", final, count)
     except Exception:
         log.exception("Delta failed for %s", mount)
@@ -370,41 +415,75 @@ def _snapshot(
     label: str,
     serial: str | None = None,
     cancel_evt: threading.Event | None = None,
-) -> None:
+) -> str | None:
     cancel_evt = cancel_evt or threading.Event()
     try:
         entries_map = _scan_entries(mount, cancel_evt)
     except ScanRootError:
         log.warning("Snapshot skipped: root scan failed for %s", mount)
-        return
+        return None
     if cancel_evt.is_set():
-        return
+        return None
 
     serial_tag = f"_{serial}" if serial else ""
     ts = _timestamp()
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
+    snapshot_id = str(uuid.uuid4())
+
+    header = {
+        "id": snapshot_id,
+        "type": "snapshot",
+        "created_at": _timestamp_to_iso(ts),
+        "drive": {
+            "serial": serial,
+            "label": label,
+            "mount": str(mount),
+        },
+    }
 
     def _lines():
         for relpath, (size, mtime, file_hash, flag) in entries_map.items():
             yield f"{_escape_path(relpath)}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
 
     try:
-        count = _write_atomic_gz(final, _lines())
+        count = _write_atomic_gz(final, header, _lines())
         log.info("Snapshot written: %s (%d entries)", final, count)
+        return snapshot_id
     except Exception:
         log.exception("Snapshot failed for %s", mount)
+        return None
 
 
 def _do_snapshot(
     mount: Path, label: str, serial: str | None, cancel_evt: threading.Event
 ) -> None:
-    if serial:
-        old = _load_manifest(serial)
-        if old:
-            log.info("Prior manifest found for serial %s; writing delta", serial)
-            _write_delta(mount, label, serial, old, cancel_evt)
-            return
-    _snapshot(mount, label, serial, cancel_evt)
+    snapshot_id = _snapshot(mount, label, serial, cancel_evt)
+    if not snapshot_id:
+        return
+
+    with _lock:
+        for drive_id, entry in _active.items():
+            if isinstance(entry, dict) and entry.get("serial") == serial:
+                entry["baseline_id"] = snapshot_id
+                break
+
+
+def _find_baseline_id(serial: str) -> str | None:
+    """Find the baseline snapshot ID for a given serial by reading headers."""
+    if not serial:
+        return None
+    for cand in LOGS_DIR.glob("snapshot_*.tsv.gz"):
+        try:
+            with gzip.open(cand, "rb") as gz:
+                first_line = gz.readline().decode("utf-8", errors="replace")
+                if first_line.startswith("#"):
+                    header = json.loads(first_line[1:])
+                    if (header.get("type") == "snapshot" and
+                        header.get("drive", {}).get("serial") == serial):
+                        return header.get("id")
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
 
 
 def on_connect(
@@ -414,9 +493,26 @@ def on_connect(
         serial = _volume_serial(mount)
 
     cancel_evt = threading.Event()
-    t_snap = threading.Thread(
-        target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
-    )
+    baseline_id = _find_baseline_id(serial)
+
+    if baseline_id:
+        old_manifest = _load_manifest(baseline_id)
+        if old_manifest:
+            log.info("Prior snapshot found (id=%s) for serial %s; will write delta", baseline_id, serial)
+            t_snap = threading.Thread(
+                target=_write_delta,
+                args=(mount, label, serial, baseline_id, old_manifest, cancel_evt),
+                daemon=True
+            )
+        else:
+            log.warning("Baseline ID found but manifest load failed; creating new snapshot")
+            t_snap = threading.Thread(
+                target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
+            )
+    else:
+        t_snap = threading.Thread(
+            target=_do_snapshot, args=(mount, label, serial, cancel_evt), daemon=True
+        )
 
     with _lock:
         if _is_shutting_down or drive_id in _active:
@@ -425,9 +521,8 @@ def on_connect(
             "cancel_evt": cancel_evt,
             "snapshot_thread": t_snap,
             "serial": serial,
+            "baseline_id": baseline_id,
         }
-        # Start under the lock so every entry in _active has a started thread;
-        # otherwise on_disconnect / _teardown_all could join() before start().
         t_snap.start()
 
     log.info(
