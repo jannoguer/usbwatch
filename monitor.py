@@ -8,6 +8,7 @@ import collections
 import ctypes
 import glob as _glob
 import gzip
+import hashlib
 import logging
 import logging.handlers
 import os
@@ -176,7 +177,26 @@ def _volume_serial(mount: Path) -> str | None:
     return None
 
 
-def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
+def _hash_file(
+    path: str, cancel_evt: threading.Event, chunk_size: int = 1024 * 1024
+) -> str:
+    """SHA-256 of a file's contents; "-" on read error or cancellation."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                if cancel_evt.is_set():
+                    return "-"
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return "-"
+    return h.hexdigest()
+
+
+def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str, str]]:
     pattern = f"snapshot_*_{_glob.escape(serial)}_*.tsv.gz"
     candidates = sorted(LOGS_DIR.glob(pattern), key=lambda p: p.name, reverse=True)
     for cand in candidates:
@@ -186,17 +206,22 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
         except Exception:
             log.exception("Failed to load manifest %s", cand)
             continue
-        manifest: dict[str, tuple[int | str, str, str]] = {}
+        manifest: dict[str, tuple[int | str, str, str, str]] = {}
         for raw_line in data.splitlines():
             line = raw_line.decode("utf-8", errors="replace")
             parts = line.split("\t")
-            if len(parts) != 4:
+            if len(parts) == 5:
+                relpath, size_s, mtime, file_hash, flag = parts
+            elif len(parts) == 4:
+                # Legacy 4-column manifest: no hash column.
+                relpath, size_s, mtime, flag = parts
+                file_hash = "-"
+            else:
                 continue
-            relpath, size_s, mtime, flag = parts
             size: int | str = (
                 int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
             )
-            manifest[_unescape_path(relpath)] = (size, mtime, flag)
+            manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
         return manifest
     return {}
 
@@ -216,8 +241,8 @@ class ScanRootError(OSError):
 
 def _scan_entries(
     mount: Path, cancel_evt: threading.Event
-) -> dict[str, tuple[int | str, str, str]]:
-    entries_map: dict[str, tuple[int | str, str, str]] = {}
+) -> dict[str, tuple[int | str, str, str, str]]:
+    entries_map: dict[str, tuple[int | str, str, str, str]] = {}
     stack: collections.deque[Path] = collections.deque([mount])
     # Distinguishes the mount-root scandir failure (fatal) from sub-dir failures (skip).
     root_scan = True
@@ -258,13 +283,14 @@ def _scan_entries(
                 mtime = "-"
 
             if is_symlink:
-                entries_map[relpath] = ("-", mtime, "L")
+                entries_map[relpath] = ("-", mtime, "-", "L")
             elif is_dir:
                 dirs_to_push.append(Path(entry.path))
-                entries_map[relpath] = ("-", mtime, "D")
+                entries_map[relpath] = ("-", mtime, "-", "D")
             else:
                 size = st.st_size if st else -1
-                entries_map[relpath] = (size, mtime, "F")
+                file_hash = _hash_file(entry.path, cancel_evt) if st else "-"
+                entries_map[relpath] = (size, mtime, file_hash, "F")
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
         stack.extend(dirs_to_push)
         if len(entries_map) - last_logged >= 10_000:
@@ -293,7 +319,7 @@ def _write_delta(
     mount: Path,
     label: str,
     serial: str,
-    old_manifest: dict[str, tuple[int | str, str, str]],
+    old_manifest: dict[str, tuple[int | str, str, str, str]],
     cancel_evt: threading.Event,
 ) -> None:
     try:
@@ -308,17 +334,29 @@ def _write_delta(
     final = LOGS_DIR / f"delta_{_safe(label)}_{serial}_{ts}.tsv.gz"
 
     def _lines():
-        for relpath, (size, mtime, flag) in current_entries.items():
+        for relpath, (size, mtime, file_hash, flag) in current_entries.items():
             enc_relpath = _escape_path(relpath)
             if relpath not in old_manifest:
-                yield f"+\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
+                yield f"+\t{enc_relpath}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
             else:
-                old_size, old_mtime, old_flag = old_manifest[relpath]
-                if size != old_size or mtime != old_mtime or flag != old_flag:
-                    yield f"~\t{enc_relpath}\t{size}\t{mtime}\t{flag}\n"
+                old_size, old_mtime, old_hash, old_flag = old_manifest[relpath]
+                # Hash diff only counts when both sides recorded one;
+                # legacy 4-col manifests carry "-" and must not force "~" alone.
+                hash_changed = (
+                    file_hash != old_hash
+                    and old_hash != "-"
+                    and file_hash != "-"
+                )
+                if (
+                    size != old_size
+                    or mtime != old_mtime
+                    or flag != old_flag
+                    or hash_changed
+                ):
+                    yield f"~\t{enc_relpath}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
         for relpath in old_manifest:
             if relpath not in current_entries:
-                yield f"-\t{_escape_path(relpath)}\t-\t-\t-\n"
+                yield f"-\t{_escape_path(relpath)}\t-\t-\t-\t-\n"
 
     try:
         count = _write_atomic_gz(final, _lines())
@@ -347,8 +385,8 @@ def _snapshot(
     final = LOGS_DIR / f"snapshot_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
 
     def _lines():
-        for relpath, (size, mtime, flag) in entries_map.items():
-            yield f"{_escape_path(relpath)}\t{size}\t{mtime}\t{flag}\n"
+        for relpath, (size, mtime, file_hash, flag) in entries_map.items():
+            yield f"{_escape_path(relpath)}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
 
     try:
         count = _write_atomic_gz(final, _lines())
