@@ -13,6 +13,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import shutil
 import signal
 import sys
 import threading
@@ -389,30 +390,26 @@ def _scan_entries(
     return entries_map
 
 
-def _compute_entries_sha256(lines_iter) -> tuple[list[str], str]:
-    """Compute SHA-256 of TSV lines and return (lines, hex_digest)."""
-    h = hashlib.sha256()
-    lines = []
-    for line in lines_iter:
-        lines.append(line)
-        h.update(line.encode("utf-8", errors="replace"))
-    return lines, h.hexdigest()
-
-
 def _write_atomic_gz(final: Path, header: dict, lines_iter) -> int:
     """Write lines to a gzip file atomically via a .tmp sibling + os.replace."""
     tmp = final.parent / (final.name + ".tmp")
+    body_tmp = final.parent / (final.name + ".body.tmp")
     count = 0
     try:
-        lines, entries_sha256 = _compute_entries_sha256(lines_iter)
-        header["entries_count"] = len(lines)
-        header["entries_sha256"] = entries_sha256
+        h = hashlib.sha256()
+        with open(body_tmp, "wb") as bf:
+            for line in lines_iter:
+                encoded = line.encode("utf-8", errors="replace")
+                h.update(encoded)
+                bf.write(encoded)
+                count += 1
+        header["entries_count"] = count
+        header["entries_sha256"] = h.hexdigest()
 
         with gzip.open(tmp, "wb", compresslevel=1) as gz:
             gz.write(f"#{json.dumps(header, separators=(',', ':'))}\n".encode("utf-8"))
-            for line in lines:
-                gz.write(line.encode("utf-8", errors="replace"))
-                count += 1
+            with open(body_tmp, "rb") as bf:
+                shutil.copyfileobj(bf, gz)
         os.replace(tmp, final)
 
         manifest_id = header.get("id")
@@ -424,6 +421,8 @@ def _write_atomic_gz(final: Path, header: dict, lines_iter) -> int:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    finally:
+        body_tmp.unlink(missing_ok=True)
 
 
 def _write_delta(
