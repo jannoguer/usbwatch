@@ -99,7 +99,7 @@ python -c "import gzip,sys,glob;[sys.stdout.buffer.write(gzip.open(f).read())for
 
 ## To do
 
-- [ ] Add an optional `--debug` flag to enable console output (in addition to log files).
+- [X] Add an optional `--debug` flag to enable console output (in addition to log files).
 - [ ] Add an optional auto-sync feature to sync specific files or directories from the USB drive.
 - [ ] Add macOS support.
 - [ ] Implement file hashing (SHA-256) for more robust change detection.

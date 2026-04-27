@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 
+import argparse
 import atexit
 import collections
 import ctypes
@@ -33,13 +34,28 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-_devnull_fd = os.open(os.devnull, os.O_WRONLY)
-_devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
-sys.stdout = _devnull_out
-# stderr is left alone: logging's lastResort handler writes there as a
-# fallback before our log file opens.
-atexit.register(lambda: os.close(_devnull_fd))
-atexit.register(_devnull_out.close)
+_argparser = argparse.ArgumentParser(prog="monitor.py")
+_argparser.add_argument(
+    "--debug",
+    action="store_true",
+    help="enable console logging",
+)
+_args = _argparser.parse_args()
+
+if _args.debug:
+    _console_handler = logging.StreamHandler(sys.stdout)
+    _console_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logging.getLogger().addHandler(_console_handler)
+else:
+    _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
+    sys.stdout = _devnull_out
+    # stderr is left alone: logging's lastResort handler writes there as a
+    # fallback before our log file opens.
+    atexit.register(lambda: os.close(_devnull_fd))
+    atexit.register(_devnull_out.close)
 
 _shutdown = threading.Event()
 _is_shutting_down = False
