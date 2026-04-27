@@ -36,28 +36,55 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
-_argparser = argparse.ArgumentParser(prog="monitor.py")
+class SubcommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def _format_action(self, action):
+        parts = super()._format_action(action)
+        if action.nargs == argparse.PARSER:
+            parts = "\n".join(parts.split("\n")[1:])
+        return parts
+
+    def _format_usage(self, usage, actions, groups, prefix):
+        result = super()._format_usage(usage, actions, groups, prefix)
+        # Remove the {subcommand} metavar from usage line
+        import re
+        result = re.sub(r'\s*\{[^}]+\}\s*\.\.\.', ' ...', result)
+        return result
+
+_argparser = argparse.ArgumentParser(
+    prog="monitor.py",
+    formatter_class=SubcommandHelpFormatter
+)
 _argparser.add_argument(
     "--debug",
     action="store_true",
     help="enable console logging",
 )
+_subparsers = _argparser.add_subparsers(dest="command", title="subcommands")
+
+_materialize_parser = _subparsers.add_parser("materialize", help="reconstruct snapshot by applying deltas")
+_materialize_parser.add_argument(
+    "snapshot",
+    type=Path,
+    help="path to baseline snapshot file (snapshot_*.tsv.gz)",
+)
+
 _args = _argparser.parse_args()
 
-if _args.debug:
-    _console_handler = logging.StreamHandler(sys.stdout)
-    _console_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    )
-    logging.getLogger().addHandler(_console_handler)
-else:
-    _devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
-    sys.stdout = _devnull_out
-    # stderr is left alone: logging's lastResort handler writes there as a
-    # fallback before our log file opens.
-    atexit.register(lambda: os.close(_devnull_fd))
-    atexit.register(_devnull_out.close)
+if _args.command != "materialize":
+    if _args.debug:
+        _console_handler = logging.StreamHandler(sys.stdout)
+        _console_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        logging.getLogger().addHandler(_console_handler)
+    else:
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        _devnull_out = os.fdopen(_devnull_fd, "w", closefd=False)
+        sys.stdout = _devnull_out
+        # stderr is left alone: logging's lastResort handler writes there as a
+        # fallback before our log file opens.
+        atexit.register(lambda: os.close(_devnull_fd))
+        atexit.register(_devnull_out.close)
 
 _shutdown = threading.Event()
 _is_shutting_down = False
@@ -462,7 +489,7 @@ def _do_snapshot(
         return
 
     with _lock:
-        for drive_id, entry in _active.items():
+        for drive_id, entry in list(_active.items()):
             if isinstance(entry, dict) and entry.get("serial") == serial:
                 entry["baseline_id"] = snapshot_id
                 break
@@ -549,6 +576,174 @@ def on_disconnect(drive_id: str) -> None:
             name=f"join-{drive_id}",
             daemon=True,
         ).start()
+
+
+def _read_manifest_with_header(path: Path) -> tuple[dict, dict[str, tuple[int | str, str, str, str]]]:
+    """Read a manifest file and return (header, entries_dict)."""
+    try:
+        with gzip.open(path, "rb") as gz:
+            data = gz.read()
+    except Exception as exc:
+        raise ValueError(f"Failed to read {path}: {exc}") from exc
+
+    lines = data.splitlines()
+    if not lines:
+        raise ValueError(f"Empty manifest: {path}")
+
+    first_line = lines[0].decode("utf-8", errors="replace")
+    if not first_line.startswith("#"):
+        raise ValueError(f"Missing JSON header in {path}")
+
+    try:
+        header = json.loads(first_line[1:])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON header in {path}: {exc}") from exc
+
+    manifest: dict[str, tuple[int | str, str, str, str]] = {}
+    for raw_line in lines[1:]:
+        line = raw_line.decode("utf-8", errors="replace")
+        parts = line.split("\t")
+        if len(parts) == 5:
+            relpath, size_s, mtime, file_hash, flag = parts
+        elif len(parts) == 4:
+            relpath, size_s, mtime, flag = parts
+            file_hash = "-"
+        else:
+            continue
+        size: int | str = (
+            int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
+        )
+        manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
+
+    return header, manifest
+
+
+def _find_deltas_for_baseline(baseline_id: str) -> list[tuple[Path, str]]:
+    """Find all delta files that reference the given baseline_id, return (path, created_at) tuples."""
+    deltas = []
+    for delta_path in LOGS_DIR.glob("delta_*.tsv.gz"):
+        try:
+            with gzip.open(delta_path, "rb") as gz:
+                first_line = gz.readline().decode("utf-8", errors="replace")
+                if first_line.startswith("#"):
+                    header = json.loads(first_line[1:])
+                    if header.get("baseline_id") == baseline_id:
+                        created_at = header.get("created_at", "")
+                        deltas.append((delta_path, created_at))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return sorted(deltas, key=lambda x: x[1])
+
+
+def _apply_delta(
+    manifest: dict[str, tuple[int | str, str, str, str]],
+    delta_path: Path
+) -> dict[str, tuple[int | str, str, str, str]]:
+    """Apply a delta file to a manifest and return the updated manifest."""
+    try:
+        with gzip.open(delta_path, "rb") as gz:
+            data = gz.read()
+    except Exception as exc:
+        raise ValueError(f"Failed to read delta {delta_path}: {exc}") from exc
+
+    lines = data.splitlines()
+    if not lines:
+        return manifest
+
+    first_line = lines[0].decode("utf-8", errors="replace")
+    if first_line.startswith("#"):
+        lines = lines[1:]
+
+    result = dict(manifest)
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+
+        change = parts[0]
+        relpath = _unescape_path(parts[1])
+
+        if change == "+":
+            size_s, mtime, file_hash, flag = parts[2], parts[3], parts[4], parts[5]
+            size: int | str = (
+                int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
+            )
+            result[relpath] = (size, mtime, file_hash, flag)
+        elif change == "~":
+            size_s, mtime, file_hash, flag = parts[2], parts[3], parts[4], parts[5]
+            size: int | str = (
+                int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
+            )
+            result[relpath] = (size, mtime, file_hash, flag)
+        elif change == "-":
+            result.pop(relpath, None)
+
+    return result
+
+
+def materialize_snapshot(snapshot_path: Path) -> None:
+    """Reconstruct a snapshot by applying all deltas that reference it."""
+    print(f"Reading baseline snapshot: {snapshot_path}")
+    header, manifest = _read_manifest_with_header(snapshot_path)
+
+    if header.get("type") != "snapshot":
+        print(f"Error: {snapshot_path} is not a snapshot file")
+        sys.exit(1)
+
+    baseline_id = header.get("id")
+    if not baseline_id:
+        print(f"Error: snapshot missing 'id' field in header")
+        sys.exit(1)
+
+    print(f"Baseline ID: {baseline_id}")
+    print(f"Baseline entries: {len(manifest)}")
+
+    deltas = _find_deltas_for_baseline(baseline_id)
+    print(f"Found {len(deltas)} delta(s) to apply")
+
+    delta_ids = []
+    for delta_path, _ in deltas:
+        print(f"  Applying: {delta_path.name}")
+        manifest = _apply_delta(manifest, delta_path)
+        try:
+            with gzip.open(delta_path, "rb") as gz:
+                first_line = gz.readline().decode("utf-8", errors="replace")
+                if first_line.startswith("#"):
+                    delta_header = json.loads(first_line[1:])
+                    delta_ids.append(delta_header.get("id"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    print(f"Materialized entries: {len(manifest)}")
+
+    drive_info = header.get("drive", {})
+    label = drive_info.get("label", "unknown")
+    serial = drive_info.get("serial") or ""
+    serial_tag = f"_{serial}" if serial else ""
+    ts = _timestamp()
+    output_path = LOGS_DIR / f"materialized_{_safe(label)}{serial_tag}_{ts}.tsv.gz"
+
+    materialized_header = {
+        "id": str(uuid.uuid4()),
+        "type": "materialized",
+        "created_at": _timestamp_to_iso(ts),
+        "baseline_snapshot": snapshot_path.name,
+        "applied_deltas": delta_ids,
+        "drive": drive_info,
+    }
+
+    def _lines():
+        for relpath, (size, mtime, file_hash, flag) in manifest.items():
+            yield f"{_escape_path(relpath)}\t{size}\t{mtime}\t{file_hash}\t{flag}\n"
+
+    try:
+        count = _write_atomic_gz(output_path, materialized_header, _lines())
+        print(f"\nMaterialized snapshot written: {output_path}")
+        print(f"Total entries: {count}")
+    except Exception as exc:
+        print(f"Error writing materialized snapshot: {exc}")
+        sys.exit(1)
 
 
 SYSTEM = platform.system()
@@ -743,8 +938,15 @@ else:
 
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception:
-        log.exception("Fatal error in USB monitor")
-        sys.exit(1)
+    if _args.command == "materialize":
+        try:
+            materialize_snapshot(_args.snapshot)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+    else:
+        try:
+            run()
+        except Exception:
+            log.exception("Fatal error in USB monitor")
+            sys.exit(1)

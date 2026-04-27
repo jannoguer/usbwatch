@@ -19,9 +19,15 @@ Requires **Python 3.8+** and **pip**.
 pip install -r requirements.txt
 ```
 
-**Run in the background** (append `--help` for optional arguments):
+**Run USB monitoring in the background** (append `--help` for optional arguments):
 * **Windows:** `pythonw monitor.py` *(Use Task Scheduler for persistent execution)*
 * **Linux:** `python3 monitor.py &` *(Use a systemd unit for persistent execution)*
+
+**Reconstruct a snapshot by applying deltas:**
+```bash
+python monitor.py materialize <snapshot.tsv.gz>
+```
+This command takes a baseline snapshot and applies all deltas that reference it, producing a materialized snapshot in `logs/` showing the final state after all changes.
 
 ## Output
 
@@ -32,19 +38,28 @@ All files are written to `logs/` next to the script.
 | `monitor.log` | Script events, errors, and scan progress |
 | `snapshot_<label>_<serial>_<timestamp>.tsv.gz` | Full manifest on first connect (gzip-compressed TSV) |
 | `delta_<label>_<serial>_<timestamp>.tsv.gz` | Differential changes on reconnect (gzip-compressed TSV) |
+| `materialized_<label>_<timestamp>.tsv.gz` | Reconstructed snapshot with deltas applied (gzip-compressed TSV) |
 
 ### Manifest format
 
-**Snapshot files** (`snapshot_*.tsv.gz`), 5 tab-separated columns:
+All manifest files start with a JSON metadata header line (prefixed with `#`), followed by TSV data.
 
+**Snapshot files** (`snapshot_*.tsv.gz`):
 ```
+#{"id":"<uuid>","type":"snapshot","created_at":"<iso8601>","drive":{...},"entries_count":<n>,"entries_sha256":"<hash>"}
 <relpath>	<size>	<mtime>	<hash>	<flag>
 ```
 
-**Delta files** (`delta_*.tsv.gz`), 6 tab-separated columns, prefixing the same data with a change status (`+` added, `-` deleted, `~` modified):
-
+**Delta files** (`delta_*.tsv.gz`):
 ```
+#{"id":"<uuid>","type":"delta","created_at":"<iso8601>","baseline_id":"<uuid>","drive":{...},"entries_count":<n>,"entries_sha256":"<hash>"}
 <change>	<relpath>	<size>	<mtime>	<hash>	<flag>
+```
+
+**Materialized files** (`materialized_*.tsv.gz`):
+```
+#{"id":"<uuid>","type":"materialized","created_at":"<iso8601>","baseline_snapshot":"<filename>","applied_deltas":["<uuid>"...],"drive":{...},"entries_count":<n>,"entries_sha256":"<hash>"}
+<relpath>	<size>	<mtime>	<hash>	<flag>
 ```
 
 Field details:
@@ -52,6 +67,7 @@ Field details:
 - `mtime`: UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format
 - `hash`: SHA-256 hex digest of file contents, `-` for directories, symlinks, and unreadable files
 - `flag`: `F` (file), `D` (directory), `L` (symlink)
+- `change` (deltas only): `+` (added), `-` (deleted), `~` (modified)
 
 To read compressed files:
 
@@ -79,7 +95,7 @@ python -c "import gzip,sys,glob;[sys.stdout.buffer.write(gzip.open(f).read())for
 - [ ] Optionally enforce read-only mounting (Linux `remount,ro`; Windows `WriteProtect` registry flag) before scanning so the scan itself cannot alter mtimes.
 - [ ] Drive serial whitelist/blacklist so the monitor only scans (or explicitly refuses) specific volumes.
 - [ ] Add a suspicious-file flag column to manifests for `autorun.inf`, hidden files, and known executable extensions.
-- [ ] `monitor.py materialize <snapshot.tsv.gz>` subcommand that outputs a reconstructed snapshot equal to the given baseline with every delta recorded on the given day applied to it. Defaults to today; deltas are discovered in the same directory by matching the serial parsed from the input filename.
+- [X] `monitor.py materialize <snapshot.tsv.gz>` subcommand that outputs a reconstructed snapshot equal to the given baseline with every delta recorded matching snapshot id.
 - [X] Embed a JSON metadata header in each snapshot and delta (type, serial, label, timestamp, format version, and a baseline reference for deltas) so `materialize` can validate inputs and locate related files without parsing filenames or globbing.
 - [ ] Live file watching (`inotify` / `ReadDirectoryChangesW`) while the drive stays connected, to capture changes between connect and disconnect.
 - [ ] Config file support (TOML) so non-trivial settings (filters, webhooks, retention) don't require long CLI invocations.
