@@ -33,6 +33,8 @@ pythonw monitor.py
 python3 monitor.py &
 ```
 
+Pass `--debug` to mirror log records to stdout in addition to the log file (useful when running interactively).
+
 For persistent background execution use Task Scheduler (Windows) or a systemd unit (Linux).
 
 ## Features
@@ -58,22 +60,25 @@ All files are written to `logs/` next to the script.
 
 ### Manifest format
 
-**Snapshot files** (`snapshot_*.tsv.gz`), 4 tab-separated columns:
+**Snapshot files** (`snapshot_*.tsv.gz`), 5 tab-separated columns:
 
 ```
-<relpath>	<size>	<mtime>	<flag>
+<relpath>	<size>	<mtime>	<hash>	<flag>
 ```
 
-**Delta files** (`delta_*.tsv.gz`), 5 tab-separated columns, prefixing the same data with a change status (`+` added, `-` deleted, `~` modified):
+**Delta files** (`delta_*.tsv.gz`), 6 tab-separated columns, prefixing the same data with a change status (`+` added, `-` deleted, `~` modified):
 
 ```
-<change>	<relpath>	<size>	<mtime>	<flag>
+<change>	<relpath>	<size>	<mtime>	<hash>	<flag>
 ```
 
 Field details:
 - `size`: byte count for files, `-` for directories and symlinks
 - `mtime`: UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format
+- `hash`: SHA-256 hex digest of file contents, `-` for directories, symlinks, and unreadable files
 - `flag`: `F` (file), `D` (directory), `L` (symlink)
+
+Legacy 4-column snapshots (no `hash`) are still loaded for backward compatibility; the hash check is skipped when either side is `-`, so size/mtime/flag remains the primary signal.
 
 To read compressed files:
 
@@ -89,9 +94,9 @@ python -c "import gzip,sys,glob;[sys.stdout.buffer.write(gzip.open(f).read())for
 
 **Drive detection** - Looks for removable block devices: on Windows via WMI `Win32_LogicalDisk` events (DriveType 2), on Linux via a pyudev netlink socket filtered to `block/partition` events with `ID_BUS=usb`.
 
-**Snapshotting** - On first connect it walks the entire drive with `os.scandir` and writes a gzip-compressed TSV manifest. Each entry records relative path, size, mtime, and type (file / directory / symlink). Junk system directories (`$RECYCLE.BIN`, `System Volume Information`, etc.) are skipped.
+**Snapshotting** - On first connect it walks the entire drive with `os.scandir` and writes a gzip-compressed TSV manifest. Each entry records relative path, size, mtime, SHA-256 of file contents, and type (file / directory / symlink). Hashing reads the full content of every file, so first-connect scans are I/O-bound on the drive's read throughput rather than just metadata. Junk system directories (`$RECYCLE.BIN`, `System Volume Information`, etc.) are skipped.
 
-**Delta mode** - On subsequent reconnects of the same volume (identified by serial number or filesystem UUID), the previous manifest is loaded and compared against a fresh scan. Only additions (`+`), deletions (`-`), and modifications (`~`) are written, making reconnect scans significantly faster for large drives.
+**Delta mode** - On subsequent reconnects of the same volume (identified by serial number or filesystem UUID), the previous manifest is loaded and compared against a fresh scan. A file is flagged `~` when size, mtime, or flag differs, or when both sides recorded a SHA-256 and the digests differ; the hash check catches edits that preserve size and mtime. Only additions (`+`), deletions (`-`), and modifications (`~`) are written.
 
 **Single-threaded scanning** - The scanner deliberately uses one thread per drive. USB mass-storage has a single command queue; parallel threads cause seek thrash on FAT/exFAT and NTFS-over-USB, degrading throughput on slow flash hardware.
 
@@ -102,7 +107,7 @@ python -c "import gzip,sys,glob;[sys.stdout.buffer.write(gzip.open(f).read())for
 - [X] Add an optional `--debug` flag to enable console output (in addition to log files).
 - [ ] Add an optional auto-sync feature to sync specific files or directories from the USB drive.
 - [ ] Add macOS support.
-- [ ] Implement file hashing (SHA-256) for more robust change detection.
+- [X] Implement file hashing (SHA-256) for more robust change detection.
 - [ ] Implement optional webhook notifications for drive connections (must use encrypted connections).
 - [ ] Verify gzip integrity after write by reopening and decompressing the file before discarding the `.tmp`.
 - [ ] Persist a `latest_serial → manifest_path` JSON index to replace glob+sort lookup in `_load_manifest`.
