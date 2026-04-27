@@ -526,13 +526,15 @@ def _do_snapshot(
     mount: Path, label: str, serial: str | None, cancel_evt: threading.Event, drive_id: str
 ) -> None:
     snapshot_id = _snapshot(mount, label, serial, cancel_evt)
-    if not snapshot_id:
-        return
-
     with _lock:
-        entry = _active.get(drive_id)
-        if entry and isinstance(entry, dict):
-            entry["baseline_id"] = snapshot_id
+        if snapshot_id:
+            entry = _active.get(drive_id)
+            if entry and isinstance(entry, dict):
+                entry["baseline_id"] = snapshot_id
+        else:
+            # Drop the entry so a future on_connect can retry instead of
+            # being deduped by the stale drive_id.
+            _active.pop(drive_id, None)
 
 
 def _find_baseline_id(serial: str) -> str | None:
