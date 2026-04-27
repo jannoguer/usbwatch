@@ -93,13 +93,19 @@ def _escape_path(p: str) -> str:
 
 def _unescape_path(p: str) -> str:
     import re
+
     def repl(m):
         c = m.group(1)
-        if c == "n": return "\n"
-        if c == "r": return "\r"
-        if c == "t": return "\t"
-        if c == "\\": return "\\"
+        if c == "n":
+            return "\n"
+        if c == "r":
+            return "\r"
+        if c == "t":
+            return "\t"
+        if c == "\\":
+            return "\\"
         return m.group(0)
+
     return re.sub(r"\\(.)", repl, p)
 
 
@@ -118,13 +124,17 @@ _JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 
 if platform.system() == "Windows":
     from ctypes import wintypes as _wt
+
     _GVI = ctypes.windll.kernel32.GetVolumeInformationW
     _GVI.argtypes = [
-        _wt.LPCWSTR, _wt.LPWSTR, _wt.DWORD,
+        _wt.LPCWSTR,
+        _wt.LPWSTR,
+        _wt.DWORD,
         ctypes.POINTER(_wt.DWORD),
         ctypes.POINTER(_wt.DWORD),
         ctypes.POINTER(_wt.DWORD),
-        _wt.LPWSTR, _wt.DWORD,
+        _wt.LPWSTR,
+        _wt.DWORD,
     ]
     _GVI.restype = _wt.BOOL
 
@@ -168,9 +178,7 @@ def _load_manifest(serial: str) -> dict[str, tuple[int | str, str, str]]:
                 continue
             relpath, size_s, mtime, flag = parts
             size: int | str = (
-                int(size_s)
-                if size_s.lstrip("-").isdigit() and size_s != "-"
-                else "-"
+                int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
             )
             manifest[_unescape_path(relpath)] = (size, mtime, flag)
         return manifest
@@ -208,9 +216,7 @@ def _scan_entries(
                 dir_entries = list(it)
         except OSError as exc:
             if root_scan:
-                raise ScanRootError(
-                    f"Cannot scan mount root {mount}: {exc}"
-                ) from exc
+                raise ScanRootError(f"Cannot scan mount root {mount}: {exc}") from exc
             log.warning("Cannot scan %s", current)
             continue
         finally:
