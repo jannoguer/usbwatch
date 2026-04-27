@@ -3,7 +3,6 @@ from __future__ import annotations
 
 
 import argparse
-import atexit
 import collections
 import ctypes
 import gzip
@@ -707,13 +706,7 @@ def _apply_delta(
         if not _validate_relpath(relpath):
             continue
 
-        if change == "+":
-            size_s, mtime, file_hash, flag = parts[2], parts[3], parts[4], parts[5]
-            size: int | str = (
-                int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
-            )
-            result[relpath] = (size, mtime, file_hash, flag)
-        elif change == "~":
+        if change in ("+", "~"):
             size_s, mtime, file_hash, flag = parts[2], parts[3], parts[4], parts[5]
             size: int | str = (
                 int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
@@ -736,7 +729,7 @@ def materialize_snapshot(snapshot_path: Path) -> None:
 
     baseline_id = header.get("id")
     if not baseline_id:
-        print(f"Error: snapshot missing 'id' field in header")
+        print("Error: snapshot missing 'id' field in header")
         sys.exit(1)
 
     print(f"Baseline ID: {baseline_id}")
