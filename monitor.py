@@ -100,6 +100,9 @@ signal.signal(signal.SIGTERM, _handle_signal)
 _active: dict = {}
 _lock = threading.Lock()
 
+_manifest_cache: dict[str, tuple[Path, dict]] = {}
+_cache_lock = threading.Lock()
+
 
 def _teardown_all() -> None:
     global _is_shutting_down
@@ -229,48 +232,64 @@ def _hash_file(
     return h.hexdigest()
 
 
+def _load_all_manifests() -> None:
+    """Load all manifest headers into cache at startup."""
+    with _cache_lock:
+        _manifest_cache.clear()
+        for cand in LOGS_DIR.glob("*.tsv.gz"):
+            try:
+                with gzip.open(cand, "rb") as gz:
+                    first_line = gz.readline().decode("utf-8", errors="replace")
+                    if not first_line.startswith("#"):
+                        continue
+                    header = json.loads(first_line[1:])
+                    manifest_id = header.get("id")
+                    if manifest_id:
+                        _manifest_cache[manifest_id] = (cand, header)
+            except (json.JSONDecodeError, OSError):
+                continue
+        log.info("Loaded %d manifest file headers into cache", len(_manifest_cache))
+
+
 def _load_manifest(baseline_id: str) -> dict[str, tuple[int | str, str, str, str]]:
-    """Load a snapshot manifest by its ID from the logs directory."""
-    for cand in LOGS_DIR.glob("snapshot_*.tsv.gz"):
-        try:
-            with gzip.open(cand, "rb") as gz:
-                data = gz.read()
-        except Exception:
-            log.exception("Failed to load manifest %s", cand)
-            continue
+    """Load a snapshot manifest by its ID from the cache."""
+    with _cache_lock:
+        entry = _manifest_cache.get(baseline_id)
 
-        lines = data.splitlines()
-        if not lines:
-            continue
+    if not entry:
+        return {}
 
-        first_line = lines[0].decode("utf-8", errors="replace")
-        if not first_line.startswith("#"):
-            continue
+    cand, header = entry
+    if header.get("type") != "snapshot":
+        return {}
 
-        try:
-            header = json.loads(first_line[1:])
-            if header.get("id") != baseline_id or header.get("type") != "snapshot":
-                continue
-        except (json.JSONDecodeError, KeyError):
-            continue
+    try:
+        with gzip.open(cand, "rb") as gz:
+            data = gz.read()
+    except Exception:
+        log.exception("Failed to load manifest %s", cand)
+        return {}
 
-        manifest: dict[str, tuple[int | str, str, str, str]] = {}
-        for raw_line in lines[1:]:
-            line = raw_line.decode("utf-8", errors="replace")
-            parts = line.split("\t")
-            if len(parts) == 5:
-                relpath, size_s, mtime, file_hash, flag = parts
-            elif len(parts) == 4:
-                relpath, size_s, mtime, flag = parts
-                file_hash = "-"
-            else:
-                continue
-            size: int | str = (
-                int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
-            )
-            manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
-        return manifest
-    return {}
+    lines = data.splitlines()
+    if not lines:
+        return {}
+
+    manifest: dict[str, tuple[int | str, str, str, str]] = {}
+    for raw_line in lines[1:]:
+        line = raw_line.decode("utf-8", errors="replace")
+        parts = line.split("\t")
+        if len(parts) == 5:
+            relpath, size_s, mtime, file_hash, flag = parts
+        elif len(parts) == 4:
+            relpath, size_s, mtime, flag = parts
+            file_hash = "-"
+        else:
+            continue
+        size: int | str = (
+            int(size_s) if size_s.lstrip("-").isdigit() and size_s != "-" else "-"
+        )
+        manifest[_unescape_path(relpath)] = (size, mtime, file_hash, flag)
+    return manifest
 
 
 def _fmt_time(ts: float) -> str:
@@ -370,6 +389,12 @@ def _write_atomic_gz(final: Path, header: dict, lines_iter) -> int:
                 gz.write(line.encode("utf-8", errors="replace"))
                 count += 1
         os.replace(tmp, final)
+
+        manifest_id = header.get("id")
+        if manifest_id:
+            with _cache_lock:
+                _manifest_cache[manifest_id] = (final, header)
+
         return count
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -496,21 +521,23 @@ def _do_snapshot(
 
 
 def _find_baseline_id(serial: str) -> str | None:
-    """Find the baseline snapshot ID for a given serial by reading headers."""
+    """Find the baseline snapshot ID for a given serial from cache."""
     if not serial:
         return None
-    for cand in LOGS_DIR.glob("snapshot_*.tsv.gz"):
-        try:
-            with gzip.open(cand, "rb") as gz:
-                first_line = gz.readline().decode("utf-8", errors="replace")
-                if first_line.startswith("#"):
-                    header = json.loads(first_line[1:])
-                    if (header.get("type") == "snapshot" and
-                        header.get("drive", {}).get("serial") == serial):
-                        return header.get("id")
-        except (json.JSONDecodeError, OSError):
-            continue
-    return None
+
+    candidates = []
+    with _cache_lock:
+        for manifest_id, (path, header) in _manifest_cache.items():
+            if (header.get("type") == "snapshot" and
+                header.get("drive", {}).get("serial") == serial):
+                created_at = header.get("created_at", "")
+                candidates.append((manifest_id, created_at))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
 
 
 def on_connect(
@@ -619,19 +646,14 @@ def _read_manifest_with_header(path: Path) -> tuple[dict, dict[str, tuple[int | 
 
 
 def _find_deltas_for_baseline(baseline_id: str) -> list[tuple[Path, str]]:
-    """Find all delta files that reference the given baseline_id, return (path, created_at) tuples."""
+    """Find all delta files that reference the given baseline_id from cache."""
     deltas = []
-    for delta_path in LOGS_DIR.glob("delta_*.tsv.gz"):
-        try:
-            with gzip.open(delta_path, "rb") as gz:
-                first_line = gz.readline().decode("utf-8", errors="replace")
-                if first_line.startswith("#"):
-                    header = json.loads(first_line[1:])
-                    if header.get("baseline_id") == baseline_id:
-                        created_at = header.get("created_at", "")
-                        deltas.append((delta_path, created_at))
-        except (json.JSONDecodeError, OSError):
-            continue
+    with _cache_lock:
+        for manifest_id, (path, header) in _manifest_cache.items():
+            if (header.get("type") == "delta" and
+                header.get("baseline_id") == baseline_id):
+                created_at = header.get("created_at", "")
+                deltas.append((path, created_at))
     return sorted(deltas, key=lambda x: x[1])
 
 
@@ -816,6 +838,7 @@ if SYSTEM == "Windows":
 
     def run() -> None:
         log.info("Starting USB monitor (Windows/WMI)")
+        _load_all_manifests()
         # Start watchers before scanning existing drives so a drive arriving
         # during enumeration is still caught by the Creation watcher.
         t_add = threading.Thread(
@@ -909,6 +932,7 @@ elif SYSTEM == "Linux":
         mon.filter_by(subsystem="block", device_type="partition")
         mon.start()
         log.info("Starting USB monitor (Linux/pyudev)")
+        _load_all_manifests()
         threading.Thread(
             target=_scan_existing, name="scan-existing", daemon=True
         ).start()
