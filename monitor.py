@@ -182,6 +182,10 @@ _JUNK_DIRS: frozenset[str] = frozenset(
 )
 _JUNK_DIRS_UPPER: frozenset[str] = frozenset(d.upper() for d in _JUNK_DIRS)
 
+# Windows: FILE_ATTRIBUTE_REPARSE_POINT. is_symlink() does not catch junctions
+# or other non-symlink reparse points, so we check the raw attribute too.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
 
 if platform.system() == "Windows":
     from ctypes import wintypes as _wt
@@ -359,6 +363,16 @@ def _scan_entries(
                         st = None
                         mtime = "-"
 
+                    if is_dir and st is not None and (
+                        getattr(st, "st_file_attributes", 0)
+                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        # Junction / mount point: target may live inside the
+                        # mount and produce unbounded recursion. Record it
+                        # without descending.
+                        is_dir = False
+                        is_symlink = True
+
                     if is_symlink:
                         entries_map[relpath] = ("-", mtime, "-", "L")
                     elif is_dir:
@@ -378,8 +392,18 @@ def _scan_entries(
         except OSError as exc:
             if root_scan:
                 raise ScanRootError(f"Cannot scan mount root {mount}: {exc}") from exc
+            # A subdir failure can be a real per-folder ACL/IO issue, or it
+            # can mean the device just disappeared and the removal event
+            # hasn't fired yet. Re-probe the mount root: if that also fails,
+            # abort instead of persisting the partial scan as complete.
+            try:
+                with os.scandir(mount) as probe:
+                    next(iter(probe), None)
+            except OSError as root_exc:
+                raise ScanRootError(
+                    f"Mount {mount} disappeared during scan: {root_exc}"
+                ) from root_exc
             log.warning("Cannot scan %s", current)
-            root_scan = False
             continue
         root_scan = False
         dirs_to_push.sort(key=lambda p: p.name, reverse=True)
