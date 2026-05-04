@@ -1,6 +1,6 @@
 <div align="center">
 
-# USB Monitor
+# USB Watch
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-yellow?style=flat-square)](https://www.python.org)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square)
