@@ -36,6 +36,7 @@ logging.getLogger().addHandler(_root_handler)
 logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
+
 class SubcommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def _format_action(self, action):
         parts = super()._format_action(action)
@@ -47,12 +48,13 @@ class SubcommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
         result = super()._format_usage(usage, actions, groups, prefix)
         # Remove the {subcommand} metavar from usage line
         import re
-        result = re.sub(r'\s*\{[^}]+\}\s*\.\.\.', ' ...', result)
+
+        result = re.sub(r"\s*\{[^}]+\}\s*\.\.\.", " ...", result)
         return result
 
+
 _argparser = argparse.ArgumentParser(
-    prog="monitor.py",
-    formatter_class=SubcommandHelpFormatter
+    prog="monitor.py", formatter_class=SubcommandHelpFormatter
 )
 _argparser.add_argument(
     "--debug",
@@ -61,7 +63,9 @@ _argparser.add_argument(
 )
 _subparsers = _argparser.add_subparsers(dest="command", title="subcommands")
 
-_materialize_parser = _subparsers.add_parser("materialize", help="reconstruct snapshot by applying deltas")
+_materialize_parser = _subparsers.add_parser(
+    "materialize", help="reconstruct snapshot by applying deltas"
+)
 _materialize_parser.add_argument(
     "snapshot",
     type=Path,
@@ -363,9 +367,13 @@ def _scan_entries(
                         st = None
                         mtime = "-"
 
-                    if is_dir and st is not None and (
-                        getattr(st, "st_file_attributes", 0)
-                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    if (
+                        is_dir
+                        and st is not None
+                        and (
+                            getattr(st, "st_file_attributes", 0)
+                            & _FILE_ATTRIBUTE_REPARSE_POINT
+                        )
                     ):
                         # Junction / mount point: target may live inside the
                         # mount and produce unbounded recursion. Record it
@@ -550,7 +558,11 @@ def _snapshot(
 
 
 def _do_snapshot(
-    mount: Path, label: str, serial: str | None, cancel_evt: threading.Event, drive_id: str
+    mount: Path,
+    label: str,
+    serial: str | None,
+    cancel_evt: threading.Event,
+    drive_id: str,
 ) -> None:
     snapshot_id = _snapshot(mount, label, serial, cancel_evt)
     with _lock:
@@ -572,8 +584,10 @@ def _find_baseline_id(serial: str) -> str | None:
     candidates = []
     with _cache_lock:
         for manifest_id, (path, header) in _manifest_cache.items():
-            if (header.get("type") == "snapshot" and
-                header.get("drive", {}).get("serial") == serial):
+            if (
+                header.get("type") == "snapshot"
+                and header.get("drive", {}).get("serial") == serial
+            ):
                 created_at = header.get("created_at", "")
                 candidates.append((manifest_id, created_at))
 
@@ -596,20 +610,30 @@ def on_connect(
     if baseline_id:
         old_manifest = _load_manifest(baseline_id)
         if old_manifest:
-            log.info("Prior snapshot found (id=%s) for serial %s; will write delta", baseline_id, serial)
+            log.info(
+                "Prior snapshot found (id=%s) for serial %s; will write delta",
+                baseline_id,
+                serial,
+            )
             t_snap = threading.Thread(
                 target=_write_delta,
                 args=(mount, label, serial, baseline_id, old_manifest, cancel_evt),
-                daemon=True
+                daemon=True,
             )
         else:
-            log.warning("Baseline ID found but manifest load failed; creating new snapshot")
+            log.warning(
+                "Baseline ID found but manifest load failed; creating new snapshot"
+            )
             t_snap = threading.Thread(
-                target=_do_snapshot, args=(mount, label, serial, cancel_evt, drive_id), daemon=True
+                target=_do_snapshot,
+                args=(mount, label, serial, cancel_evt, drive_id),
+                daemon=True,
             )
     else:
         t_snap = threading.Thread(
-            target=_do_snapshot, args=(mount, label, serial, cancel_evt, drive_id), daemon=True
+            target=_do_snapshot,
+            args=(mount, label, serial, cancel_evt, drive_id),
+            daemon=True,
         )
 
     with _lock:
@@ -649,7 +673,9 @@ def on_disconnect(drive_id: str) -> None:
         ).start()
 
 
-def _read_manifest_with_header(path: Path) -> tuple[dict, dict[str, tuple[int | str, str, str, str]]]:
+def _read_manifest_with_header(
+    path: Path,
+) -> tuple[dict, dict[str, tuple[int | str, str, str, str]]]:
     """Read a manifest file and return (header, entries_dict)."""
     try:
         with gzip.open(path, "rb") as gz:
@@ -697,16 +723,17 @@ def _find_deltas_for_baseline(baseline_id: str) -> list[tuple[Path, str]]:
     deltas = []
     with _cache_lock:
         for manifest_id, (path, header) in _manifest_cache.items():
-            if (header.get("type") == "delta" and
-                header.get("baseline_id") == baseline_id):
+            if (
+                header.get("type") == "delta"
+                and header.get("baseline_id") == baseline_id
+            ):
                 created_at = header.get("created_at", "")
                 deltas.append((path, created_at))
     return sorted(deltas, key=lambda x: x[1])
 
 
 def _apply_delta(
-    manifest: dict[str, tuple[int | str, str, str, str]],
-    delta_path: Path
+    manifest: dict[str, tuple[int | str, str, str, str]], delta_path: Path
 ) -> dict[str, tuple[int | str, str, str, str]]:
     """Apply a delta file to a manifest and return the updated manifest."""
     try:
